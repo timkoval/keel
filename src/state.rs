@@ -16,6 +16,12 @@ const CLEAR_CLAIM_COLS: &str = "\
 claim_worker = NULL, claim_token = NULL, claim_role = NULL, claim_external = 0, \
 claim_pid = NULL, claim_pgid = NULL, claim_starttime = NULL, lease_until = NULL";
 
+/// Item rows also drop the claim-time git snapshot. Jobs do not have that column.
+const CLEAR_ITEM_CLAIM_COLS: &str = "\
+claim_snapshot = NULL, \
+claim_worker = NULL, claim_token = NULL, claim_role = NULL, claim_external = 0, \
+claim_pid = NULL, claim_pgid = NULL, claim_starttime = NULL, lease_until = NULL";
+
 const CLEAR_JOB_LEASE_COLS: &str = "\
 blocked_reason = NULL, pending_permit = NULL, \
 claim_worker = NULL, claim_token = NULL, claim_role = NULL, claim_external = 0, \
@@ -941,7 +947,7 @@ fn submit_item_document(
                 summary = ?2,
                 plan_json = ?3,
                 updated_at = ?4,
-                {CLEAR_CLAIM_COLS}
+                {CLEAR_ITEM_CLAIM_COLS}
              WHERE id = ?5 AND claim_token = ?6"
         );
         let updated = tx.execute(
@@ -2027,7 +2033,9 @@ fn write_item_claim(
 ) -> Result<Claim> {
     let claim = insert_claim_fields(tx, spec)?;
     let sql =
-        format!("UPDATE items SET state = ?1, updated_at = ?2, {SET_CLAIM_COLS} WHERE id = ?11");
+        format!(
+            "UPDATE items SET state = ?1, updated_at = ?2, claim_snapshot = NULL, {SET_CLAIM_COLS} WHERE id = ?11"
+        );
     tx.execute(
         &sql,
         params![
@@ -2190,8 +2198,12 @@ fn clear_item_claim(
     token: Option<&str>,
     stamp: Option<&LeaseStamp>,
 ) -> Result<()> {
-    let (sql, stamped) =
-        claim_clear_sql("items", CLEAR_CLAIM_COLS, token.is_some(), stamp.is_some());
+    let (sql, stamped) = claim_clear_sql(
+        "items",
+        CLEAR_ITEM_CLAIM_COLS,
+        token.is_some(),
+        stamp.is_some(),
+    );
     let updated = exec_clear(
         tx,
         &sql,

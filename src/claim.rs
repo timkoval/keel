@@ -1018,6 +1018,11 @@ fn prepare_workspace(db: &Mutex<Connection>, data_dir: &Path, facts: &Facts) -> 
         let branch = job_branch(&facts.item_id, &facts.id);
         record_job(db, &facts.id, &facts.claim.token, &worktree, &branch)?;
     }
+    if facts.target == Target::Item {
+        // Submit compares against these. The live tree cannot stand in for them.
+        let tree_head = git::rev_parse(&worktree, "HEAD")?;
+        record_item_snapshot(db, &facts.id, &facts.claim.token, &snapshot, &tree_head)?;
+    }
     partial.keep = true;
     Ok(prepared(
         facts,
@@ -1099,6 +1104,31 @@ fn required_sha<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str> {
 
 fn job_branch(item_id: &str, job_id: &str) -> String {
     format!("keel/{item_id}/{job_id}")
+}
+
+fn record_item_snapshot(
+    db: &Mutex<Connection>,
+    item_id: &str,
+    token: &str,
+    primary: &PrimarySnapshot,
+    worktree_head: &str,
+) -> Result<()> {
+    let text = serde_json::json!({
+        "head": primary.head,
+        "branch": primary.branch,
+        "porcelain": primary.porcelain,
+        "worktree_head": worktree_head,
+    })
+    .to_string();
+    let conn = lock_db(db)?;
+    let updated = conn.execute(
+        "UPDATE items SET claim_snapshot = ?1 WHERE id = ?2 AND claim_token = ?3",
+        params![text, item_id, token],
+    )?;
+    if updated != 1 {
+        return Err(Error::Invalid("claim snapshot was not recorded".into()));
+    }
+    Ok(())
 }
 
 fn record_job(

@@ -2,13 +2,14 @@
 //! Each tool is one Unix-socket call. This process does not open SQLite and
 //! does not send `x-keel-surface: cli`, so the tool list cannot merge.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde_json::{json, Map, Value};
 
 use crate::cli;
 use crate::config::Config;
 use crate::db::{Error, Result};
+use crate::http::{BODY_MAX, HEADER_MAX};
 use crate::render;
 
 const PROTOCOL: &str = "2024-11-05";
@@ -25,58 +26,147 @@ const TOOLS: &[&str] = &[
 ];
 
 pub fn serve(config: &Config) -> Result<()> {
+    // One id for the life of this process. Review compares worker ids, not pids.
+    let worker_id = mint_worker_id()?;
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
+    drive(config, &worker_id, &mut reader, &mut stdout)
+}
+
+fn mint_worker_id() -> Result<String> {
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(32);
+    for byte in buf {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    Ok(format!("mcp:{hex}"))
+}
+
+enum Frame {
+    Message(Vec<u8>),
+    /// Larger than the socket body cap. Do not allocate it.
+    TooLarge,
+}
+
+fn drive(
+    config: &Config,
+    worker_id: &str,
+    reader: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<()> {
     loop {
-        let Some(bytes) = read_frame(&mut reader)? else {
-            return Ok(());
-        };
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            continue;
+        match read_frame(reader)? {
+            None => return Ok(()),
+            Some(Frame::TooLarge) => {
+                // Stop. The remainder of the frame is not a following message.
+                write_message(
+                    out,
+                    &rpc_error(Value::Null, -32600, "message exceeds the socket body cap"),
+                )?;
+                return Ok(());
+            }
+            Some(Frame::Message(bytes)) => {
+                if bytes.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let response = match handle_bytes(config, &bytes, worker_id) {
+                    Ok(Some(response)) => response,
+                    Ok(None) => continue,
+                    Err(err) => rpc_error(Value::Null, -32603, &err.to_string()),
+                };
+                write_message(out, &response)?;
+            }
         }
-        let response = match handle_bytes(config, &bytes) {
-            Ok(Some(response)) => response,
-            Ok(None) => continue,
-            Err(err) => rpc_error(Value::Null, -32603, &err.to_string()),
-        };
-        write_message(&mut stdout, &response)?;
     }
 }
 
-fn read_frame(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
-    let mut first = String::new();
-    loop {
-        first.clear();
-        if reader.read_line(&mut first)? == 0 {
-            return Ok(None);
+fn read_frame(reader: &mut impl BufRead) -> Result<Option<Frame>> {
+    let first = loop {
+        match read_limited(reader, BODY_MAX)? {
+            None => return Ok(None),
+            Some(Limited::TooLarge) => return Ok(Some(Frame::TooLarge)),
+            Some(Limited::Done(line)) if line.iter().all(u8::is_ascii_whitespace) => continue,
+            Some(Limited::Done(line)) => break line,
         }
-        if !first.trim().is_empty() {
-            break;
-        }
-    }
-    if first.trim_start().starts_with('{') {
-        return Ok(Some(first.into_bytes()));
+    };
+    if first.first() == Some(&b'{') {
+        return Ok(Some(Frame::Message(first)));
     }
     // LSP-style framing. A client that still sends Content-Length is the same protocol.
-    let mut headers = first;
+    let mut headers = String::from_utf8_lossy(&first).into_owned();
     if !headers.to_ascii_lowercase().starts_with("content-length:") {
         return Err(Error::Invalid("mcp message is not json".into()));
     }
+    let mut used = headers.len();
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Err(Error::Invalid("eof".into()));
+        if used > HEADER_MAX {
+            return Ok(Some(Frame::TooLarge));
         }
-        if line == "\n" || line == "\r\n" {
-            break;
+        match read_limited(reader, HEADER_MAX.saturating_sub(used))? {
+            None => return Err(Error::Invalid("eof".into())),
+            Some(Limited::TooLarge) => return Ok(Some(Frame::TooLarge)),
+            Some(Limited::Done(line)) if line.is_empty() || line == b"\r" => break,
+            Some(Limited::Done(line)) => {
+                used = used.saturating_add(line.len()).saturating_add(1);
+                headers.push_str(&String::from_utf8_lossy(&line));
+                headers.push('\n');
+            }
         }
-        headers.push_str(&line);
     }
     let length = content_length(&headers)?;
+    if length > BODY_MAX {
+        return Ok(Some(Frame::TooLarge));
+    }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
-    Ok(Some(body))
+    Ok(Some(Frame::Message(body)))
+}
+
+enum Limited {
+    Done(Vec<u8>),
+    TooLarge,
+}
+
+/// One line, without the newline, capped so a stdio client cannot force an allocation.
+fn read_limited(reader: &mut impl BufRead, cap: usize) -> Result<Option<Limited>> {
+    let mut buf = Vec::new();
+    loop {
+        let (take, newline, eof) = {
+            let data = reader.fill_buf()?;
+            if data.is_empty() {
+                (0, false, true)
+            } else if let Some(index) = data.iter().position(|byte| *byte == b'\n') {
+                (index, true, false)
+            } else {
+                (data.len(), false, false)
+            }
+        };
+        if eof {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(Limited::Done(buf)));
+        }
+        if buf.len().saturating_add(take) > cap {
+            reader.consume(take + usize::from(newline));
+            return Ok(Some(Limited::TooLarge));
+        }
+        {
+            let data = reader.fill_buf()?;
+            buf.extend_from_slice(&data[..take]);
+        }
+        reader.consume(take + usize::from(newline));
+        if newline {
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(Limited::Done(buf)));
+        }
+    }
 }
 
 fn content_length(headers: &str) -> Result<usize> {
@@ -103,15 +193,23 @@ fn write_message(out: &mut impl Write, value: &Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn handle_bytes(config: &Config, bytes: &[u8]) -> Result<Option<Value>> {
+pub(crate) fn handle_bytes(
+    config: &Config,
+    bytes: &[u8],
+    worker_id: &str,
+) -> Result<Option<Value>> {
     let value: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(_) => return Ok(Some(rpc_error(Value::Null, -32700, "parse error"))),
     };
-    handle_value(config, &value)
+    handle_value(config, &value, worker_id)
 }
 
-pub(crate) fn handle_value(config: &Config, message: &Value) -> Result<Option<Value>> {
+pub(crate) fn handle_value(
+    config: &Config,
+    message: &Value,
+    worker_id: &str,
+) -> Result<Option<Value>> {
     let Some(object) = message.as_object() else {
         return Ok(Some(rpc_error(Value::Null, -32600, "invalid request")));
     };
@@ -127,7 +225,7 @@ pub(crate) fn handle_value(config: &Config, message: &Value) -> Result<Option<Va
         "initialize" => Ok(initialize(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_defs() })),
-        "tools/call" => tools_call(config, &params),
+        "tools/call" => tools_call(config, worker_id, &params),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         _ => Err(rpc_failure(-32601, "method not found")),
     };
@@ -220,7 +318,7 @@ fn tool_defs() -> Vec<Value> {
         ),
         tool(
             "keel_claim",
-            "Claim an item or job. pid is the client process, stored as an external lease. A null pid is refused. The daemon does not signal that pid.",
+            "Claim an item or job. pid is the client process, stored as an external lease. A null pid is refused. The daemon does not signal that pid. worker_id must be this process id when set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -280,7 +378,11 @@ fn tool(name: &str, description: &str, schema: Value) -> Value {
     })
 }
 
-fn tools_call(config: &Config, params: &Value) -> std::result::Result<Value, RpcFailure> {
+fn tools_call(
+    config: &Config,
+    worker_id: &str,
+    params: &Value,
+) -> std::result::Result<Value, RpcFailure> {
     let object = params
         .as_object()
         .ok_or_else(|| rpc_failure(-32602, "tools/call params must be an object"))?;
@@ -298,7 +400,7 @@ fn tools_call(config: &Config, params: &Value) -> std::result::Result<Value, Rpc
         Some(Value::Object(map)) => map.clone(),
         Some(_) => return Err(rpc_failure(-32602, "arguments must be an object")),
     };
-    match dispatch_tool(config, name, &args) {
+    match dispatch_tool(config, worker_id, name, &args) {
         Ok(value) => {
             let text = serde_json::to_string(&value)
                 .map_err(|err| rpc_failure(-32603, format!("json: {err}")))?;
@@ -315,13 +417,18 @@ fn tool_result(text: &str, is_error: bool) -> Value {
     })
 }
 
-fn dispatch_tool(config: &Config, name: &str, args: &Map<String, Value>) -> Result<Value> {
+fn dispatch_tool(
+    config: &Config,
+    worker_id: &str,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<Value> {
     match name {
         "keel_add" => tool_add(config, args),
         "keel_list" => tool_list(config, args),
         "keel_show" => tool_show(config, args),
         "keel_queue" => tool_queue(config, args),
-        "keel_claim" => tool_claim(config, args),
+        "keel_claim" => tool_claim(config, worker_id, args),
         "keel_heartbeat" => tool_heartbeat(config, args),
         "keel_submit" => tool_submit(config, args),
         "keel_release" => tool_release(config, args),
@@ -376,7 +483,7 @@ fn tool_queue(config: &Config, args: &Map<String, Value>) -> Result<Value> {
     socket(config, "GET", &format!("/v1/queues/{name}"), None)
 }
 
-fn tool_claim(config: &Config, args: &Map<String, Value>) -> Result<Value> {
+fn tool_claim(config: &Config, worker_id: &str, args: &Map<String, Value>) -> Result<Value> {
     let id = require_id(args)?;
     let kind = require_kind(args)?;
     let role = required_str(args, "role")?;
@@ -389,14 +496,20 @@ fn tool_claim(config: &Config, args: &Map<String, Value>) -> Result<Value> {
     }
     // A missing pid must not become a daemon-spawned claim. Those rows are signaled.
     let pid = require_pid(args)?;
-    let mut body = json!({
+    // A second id would let this process review its own implement claim.
+    if let Some(supplied) = optional_str(args, "worker_id")? {
+        if supplied != worker_id {
+            return Err(Error::Invalid(
+                "worker_id does not match this process".into(),
+            ));
+        }
+    }
+    let body = json!({
         "role": role,
         "adapter": "mcp",
         "pid": pid,
+        "worker_id": worker_id,
     });
-    if let Some(worker) = optional_str(args, "worker_id")? {
-        body["worker_id"] = json!(worker);
-    }
     let path = action_path(&kind, &id, "claim")?;
     socket(config, "POST", &path, Some(body))
 }
@@ -529,13 +642,18 @@ mod tests {
     use crate::daemon::{boot_at, scratch_dir, Rm};
     use crate::db::open;
     use rusqlite::params;
-    use std::path::Path;
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    /// One id for every claim in these tests, the same rule as `keel mcp`.
+    const WORKER: &str = "mcp:session";
 
     fn call(cfg: &Config, method: &str, params: Value) -> Value {
         handle_value(
             cfg,
             &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
+            WORKER,
         )
         .unwrap()
         .expect("response")
@@ -579,6 +697,7 @@ mod tests {
         assert!(handle_value(
             &cfg,
             &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            WORKER,
         )
         .unwrap()
         .is_none());
@@ -659,6 +778,25 @@ mod tests {
             .unwrap();
         assert_eq!(leases, 0);
 
+        let foreign = tool(
+            &cfg,
+            "keel_claim",
+            json!({
+                "id": id,
+                "kind": "item",
+                "role": "plan",
+                "pid": std::process::id(),
+                "worker_id": "mcp:other"
+            }),
+        );
+        assert_eq!(foreign["isError"], true, "{}", tool_text(&foreign));
+        assert!(
+            tool_text(&foreign).contains("does not match"),
+            "{}",
+            tool_text(&foreign)
+        );
+        assert_eq!(item_state(&cfg, &id), "inbox");
+
         let dead = tool(
             &cfg,
             "keel_claim",
@@ -689,6 +827,15 @@ mod tests {
         assert_eq!(external, 1);
         assert_eq!(claim_pid, pid);
         assert!(pgid.is_none());
+        let worker: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_worker FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker, WORKER);
         assert!(Path::new(&format!("/proc/{pid}")).exists());
 
         let beat = tool(
@@ -735,7 +882,13 @@ mod tests {
         let again = tool(
             &cfg,
             "keel_claim",
-            json!({"id": id, "kind": "item", "role": "plan", "pid": std::process::id()}),
+            json!({
+                "id": id,
+                "kind": "item",
+                "role": "plan",
+                "pid": std::process::id(),
+                "worker_id": WORKER
+            }),
         );
         assert_eq!(again["isError"], false, "{}", tool_text(&again));
         let again: Value = serde_json::from_str(&tool_text(&again)).unwrap();
@@ -757,6 +910,24 @@ mod tests {
         let queue = tool(&cfg, "keel_queue", json!({"name": "plan-review"}));
         assert_eq!(queue["isError"], false, "{}", tool_text(&queue));
         assert!(tool_text(&queue).contains(&id));
+        let queued: Value = serde_json::from_str(&tool_text(&queue)).unwrap();
+        assert!(queued["rows"][0]["url"].as_str().unwrap().contains("/plan"));
+
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, item_id, title, acceptance, state, depth, ord, updated_at)
+                 VALUES ('j_fb', ?1, 'Look', '', 'feedback_pending', 1, 0, '2026-11-25T00:00:00Z')",
+                params![id],
+            )
+            .unwrap();
+        let feedback = tool(&cfg, "keel_queue", json!({"name": "feedback"}));
+        assert_eq!(feedback["isError"], false, "{}", tool_text(&feedback));
+        let feedback_body: Value = serde_json::from_str(&tool_text(&feedback)).unwrap();
+        assert_eq!(feedback_body["rows"][0]["id"], "j_fb");
+        assert_eq!(feedback_body["rows"][0]["item_id"], id);
+        assert!(feedback_body["rows"][0].get("url").is_none());
+        assert!(!tool_text(&feedback).contains("/review"));
 
         open(&cfg.db_path)
             .unwrap()
@@ -830,14 +1001,22 @@ mod tests {
                 "id": "j_mcp",
                 "kind": "job",
                 "role": "implement",
-                "pid": std::process::id(),
-                "worker_id": "mcp:impl"
+                "pid": std::process::id()
             }),
         );
         assert_eq!(claimed["isError"], false, "{}", tool_text(&claimed));
         let claim: Value = serde_json::from_str(&tool_text(&claimed)).unwrap();
         let token = claim["claim_token"].as_str().unwrap();
         let worktree = claim["worktree"].as_str().unwrap();
+        let worker: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_worker FROM jobs WHERE id = 'j_mcp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker, WORKER);
         crate::git::commit_file(Path::new(worktree), "leaf.txt", b"leaf\n");
         let submitted = tool(
             &cfg,
@@ -855,5 +1034,160 @@ mod tests {
         assert_eq!(body["item_state"], "implementing");
         assert_ne!(item_state(&cfg, &item_id), "merged");
         drop(running);
+    }
+
+    #[test]
+    fn plan_submit_refuses_a_dirty_or_moved_tree_then_removes_the_worktree() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let repo = _rm.0.join("repo");
+        crate::git::init_repo(&repo);
+        let added = tool(
+            &cfg,
+            "keel_add",
+            json!({
+                "title": "Plan the walk",
+                "repo": repo.to_str().unwrap(),
+                "target_branch": "main"
+            }),
+        );
+        assert_eq!(added["isError"], false, "{}", tool_text(&added));
+        let created: Value = serde_json::from_str(&tool_text(&added)).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        let claimed = tool(
+            &cfg,
+            "keel_claim",
+            json!({
+                "id": id,
+                "kind": "item",
+                "role": "plan",
+                "pid": std::process::id()
+            }),
+        );
+        assert_eq!(claimed["isError"], false, "{}", tool_text(&claimed));
+        let claim: Value = serde_json::from_str(&tool_text(&claimed)).unwrap();
+        let token = claim["claim_token"].as_str().unwrap().to_string();
+        let worktree = PathBuf::from(claim["worktree"].as_str().unwrap());
+        assert!(worktree.is_dir());
+        let stored = snapshot_text(&cfg, &id).expect("claim snapshot");
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        let tree_head = stored["worktree_head"].as_str().unwrap().to_string();
+        assert!(!tree_head.is_empty());
+
+        let document = json!({"summary": "s", "jobs": [{"title": "Do"}]});
+        std::fs::write(worktree.join("dirty.txt"), b"nope\n").unwrap();
+        let dirty = submit_plan(&cfg, &id, &token, &document);
+        assert_eq!(dirty["isError"], true, "{}", tool_text(&dirty));
+        assert!(
+            tool_text(&dirty).contains("detached worktree is dirty"),
+            "{}",
+            tool_text(&dirty)
+        );
+        assert_eq!(item_state(&cfg, &id), "planning");
+        assert!(worktree.is_dir());
+        std::fs::remove_file(worktree.join("dirty.txt")).unwrap();
+
+        std::fs::write(repo.join("primary.txt"), b"moved\n").unwrap();
+        let primary = submit_plan(&cfg, &id, &token, &document);
+        assert_eq!(primary["isError"], true, "{}", tool_text(&primary));
+        assert!(
+            tool_text(&primary).contains("primary checkout changed"),
+            "{}",
+            tool_text(&primary)
+        );
+        assert_eq!(item_state(&cfg, &id), "planning");
+        std::fs::remove_file(repo.join("primary.txt")).unwrap();
+
+        crate::git::commit_file(&worktree, "leaf.txt", b"leaf\n");
+        let moved = submit_plan(&cfg, &id, &token, &document);
+        assert_eq!(moved["isError"], true, "{}", tool_text(&moved));
+        assert!(
+            tool_text(&moved).contains("detached worktree HEAD moved"),
+            "{}",
+            tool_text(&moved)
+        );
+        assert_eq!(item_state(&cfg, &id), "planning");
+        let reset = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_str().unwrap(),
+                "reset",
+                "--hard",
+                &tree_head,
+            ])
+            .status()
+            .unwrap();
+        assert!(reset.success());
+
+        let submitted = submit_plan(&cfg, &id, &token, &document);
+        assert_eq!(submitted["isError"], false, "{}", tool_text(&submitted));
+        assert_eq!(item_state(&cfg, &id), "awaiting_plan_review");
+        assert!(snapshot_text(&cfg, &id).is_none());
+        assert!(!worktree.exists());
+        drop(running);
+    }
+
+    fn snapshot_text(cfg: &Config, id: &str) -> Option<String> {
+        open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_snapshot FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn submit_plan(cfg: &Config, id: &str, token: &str, document: &Value) -> Value {
+        tool(
+            cfg,
+            "keel_submit",
+            json!({
+                "id": id,
+                "kind": "item",
+                "claim_token": token,
+                "document": document
+            }),
+        )
+    }
+
+    #[test]
+    fn oversized_frame_is_a_jsonrpc_error_and_stops() {
+        let cfg = Config {
+            profile: "default".into(),
+            port: 1,
+            data_dir: PathBuf::from("/tmp"),
+            runtime_dir: PathBuf::from("/tmp"),
+            socket_path: PathBuf::from("/tmp/keel.sock"),
+            lock_path: PathBuf::from("/tmp/keel.lock"),
+            db_path: PathBuf::from("/tmp/keel.db"),
+            docs_dir: PathBuf::from("/tmp"),
+            publish_root: PathBuf::from("/tmp"),
+        };
+        let mut oversized = format!("Content-Length: {}\r\n\r\n", BODY_MAX + 1);
+        oversized.push_str("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+        let text = drive_text(&cfg, oversized.as_bytes());
+        assert!(text.contains("jsonrpc"), "{text}");
+        assert!(text.contains("exceeds"), "{text}");
+        assert!(!text.contains("\"result\""), "{text}");
+
+        let mut line = vec![b'{'];
+        line.extend(std::iter::repeat(b'x').take(BODY_MAX));
+        line.push(b'\n');
+        let text = drive_text(&cfg, &line);
+        assert!(text.contains("exceeds"), "{text}");
+        assert!(!text.contains("\"result\""), "{text}");
+
+        let text = drive_text(
+            &cfg,
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n",
+        );
+        assert!(text.contains("\"result\""), "{text}");
+    }
+
+    fn drive_text(cfg: &Config, input: &[u8]) -> String {
+        let mut out = Vec::new();
+        drive(cfg, WORKER, &mut Cursor::new(input), &mut out).unwrap();
+        String::from_utf8(out).unwrap()
     }
 }

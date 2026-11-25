@@ -1208,16 +1208,24 @@ fn queue_json_response(shared: &Shared, kind: QueueKind) -> Response {
     };
     match load_queue(&conn, &shared.config, kind) {
         Ok(view) => {
+            let feedback = view.name == "feedback";
             let rows: Vec<Value> = view
                 .rows
                 .iter()
                 .map(|row| {
-                    json!({
+                    let mut obj = json!({
                         "id": row.id,
                         "title": row.title,
                         "summary": row.summary,
-                        "url": row.url,
-                    })
+                    });
+                    if let Some(item_id) = &row.item_id {
+                        obj["item_id"] = json!(item_id);
+                    }
+                    // The review route is not served. A feedback URL would 404.
+                    if !feedback {
+                        obj["url"] = json!(row.url);
+                    }
+                    obj
                 })
                 .collect();
             Response::json(
@@ -1463,6 +1471,7 @@ fn load_queue(conn: &Connection, config: &Config, kind: QueueKind) -> Result<Que
                     id,
                     title,
                     summary,
+                    item_id: None,
                 });
             }
             Ok(QueueView {
@@ -1498,6 +1507,7 @@ fn load_queue(conn: &Connection, config: &Config, kind: QueueKind) -> Result<Que
                     id: job_id,
                     title,
                     summary: item_title,
+                    item_id: Some(item_id),
                 });
             }
             Ok(QueueView {
@@ -1575,6 +1585,7 @@ fn note_response(shared: &Shared, id: &str, req: &Request) -> Response {
                 "point_id": point_id,
                 "state": state_name,
             }),
+            None,
         ),
         Err(err) => fail(err),
     }
@@ -1611,6 +1622,7 @@ fn waive_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) -
                 "point_id": point_id,
                 "state": state_name,
             }),
+            None,
         ),
         Err(err) => fail(err),
     }
@@ -1652,6 +1664,7 @@ fn approve_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool)
                 "base_sha": base_sha,
                 "job_ids": job_ids,
             }),
+            None,
         ),
         Err(err) => fail(err),
     }
@@ -1717,14 +1730,16 @@ fn submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
         Ok(document) => document,
         Err(err) => return fail(err),
     };
+    // Read the claim-time snapshot, then compare git outside the writer mutex.
+    let (tree, slot) = match item_submit_facts(shared, id) {
+        Ok(facts) => facts,
+        Err(err) => return fail(err),
+    };
     let submitted = {
         let mut conn = match lock_db(&shared.db) {
             Ok(conn) => conn,
             Err(err) => return fail(err),
         };
-        // Snapshot enforcement is a later submit. The claim returns one to the
-        // caller and does not store it until a column exists.
-        let tree = state::DetachedWorktree::unchanged();
         let result = match read_item_state(&conn, id) {
             Ok(state_name) => match state_name.as_str() {
                 "planning" => state::submit_plan(&mut conn, id, &token, &document, tree),
@@ -1751,9 +1766,109 @@ fn submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
                 "plan_rev": rev,
                 "plan_url": shared.config.plan_url(id),
             }),
+            slot,
         ),
         Err(err) => fail(err),
     }
+}
+
+/// Plan and revise claims store the primary checkout and the detached HEAD.
+/// A later submit cannot reconstruct either, so a missing snapshot is a refusal.
+fn item_submit_facts(
+    shared: &Shared,
+    id: &str,
+) -> Result<(state::DetachedWorktree, Option<(PathBuf, PathBuf)>)> {
+    let row = {
+        let conn = lock_db(&shared.db)?;
+        conn.query_row(
+            "SELECT repo, claim_role, claim_snapshot, state FROM items WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+    };
+    let Some((repo, role, snapshot, state)) = row else {
+        return Err(Error::NotFound(id.to_string()));
+    };
+    // A stale submit still reports the state-machine conflict. Git facts only
+    // apply while a plan or revise claim can still accept the document.
+    if state != "planning" && state != "revising" {
+        return Ok((state::DetachedWorktree::unchanged(), None));
+    }
+    let Some(repo) = repo.filter(|path| !path.is_empty()) else {
+        return Ok((state::DetachedWorktree::unchanged(), None));
+    };
+    if !render::safe_id(id) {
+        return Err(Error::NotFound(id.to_string()));
+    }
+    let slot = match role.as_deref() {
+        Some("plan") => "plan",
+        Some("revise") => "revise",
+        _ => {
+            return Err(Error::Conflict {
+                state,
+                message: "plan submit has no claim role".into(),
+            })
+        }
+    };
+    let stored = snapshot
+        .as_deref()
+        .and_then(parse_claim_snapshot)
+        .ok_or_else(|| Error::Conflict {
+            state: state.clone(),
+            message: "claim snapshot is missing".into(),
+        })?;
+    let worktree = shared.config.data_dir.join("worktrees").join(id).join(slot);
+    let repo = PathBuf::from(repo);
+    let live = crate::git::snapshot(&worktree)?;
+    let primary = crate::git::snapshot(&repo)?;
+    if primary.head != stored.head
+        || primary.branch != stored.branch
+        || primary.porcelain != stored.porcelain
+    {
+        return Err(Error::Conflict {
+            state,
+            message: "primary checkout changed".into(),
+        });
+    }
+    Ok((
+        state::DetachedWorktree {
+            clean: live.porcelain.is_empty(),
+            head_unchanged: live.head == stored.worktree_head,
+        },
+        Some((repo, worktree)),
+    ))
+}
+
+struct StoredSnapshot {
+    head: String,
+    branch: String,
+    porcelain: String,
+    worktree_head: String,
+}
+
+fn parse_claim_snapshot(text: &str) -> Option<StoredSnapshot> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    Some(StoredSnapshot {
+        head: field("head")?,
+        branch: field("branch")?,
+        porcelain: value.get("porcelain").and_then(Value::as_str)?.to_string(),
+        worktree_head: field("worktree_head")?,
+    })
 }
 
 /// Job submit stays on the socket. Git facts are read here so an MCP client
@@ -1903,9 +2018,24 @@ fn submit_held_review(
     state::submit_review(&mut conn, id, token, document, tree)
 }
 
-fn finish_plan(shared: &Shared, id: &str, mut body: Value) -> Response {
+fn finish_plan(
+    shared: &Shared,
+    id: &str,
+    mut body: Value,
+    worktree: Option<(PathBuf, PathBuf)>,
+) -> Response {
     if let Err(err) = publish_plan(shared, id) {
         body["warning"] = json!(format!("plan was not written: {err}"));
+    }
+    // The claim is already cleared. A failed remove must not roll that back.
+    if let Some((repo, path)) = worktree {
+        if let Err(err) = crate::git::remove_worktree(&repo, &path) {
+            let message = format!("plan worktree was not removed: {err}");
+            body["warning"] = match body.get("warning").and_then(Value::as_str) {
+                Some(existing) => json!(format!("{existing}; {message}")),
+                None => json!(message),
+            };
+        }
     }
     Response::json(200, body)
 }
