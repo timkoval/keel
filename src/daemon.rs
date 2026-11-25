@@ -1830,16 +1830,8 @@ fn load_plan(conn: &Connection, id: &str, config: &Config) -> Result<Option<Plan
     let document = state::validate_plan_json(&plan_json)?;
     let db_jobs = load_job_views(conn, id)?;
     let jobs = if db_jobs.is_empty() {
-        document
-            .jobs
-            .into_iter()
-            .map(|job| PlanJobView {
-                id: None,
-                parent_id: None,
-                title: job.title,
-                acceptance: job.acceptance,
-            })
-            .collect()
+        // No rows yet. Still list subjobs so plan review shows the tree.
+        views_from_plan(&document.jobs)
     } else {
         db_jobs
     };
@@ -1907,6 +1899,27 @@ fn load_points(conn: &Connection, id: &str) -> Result<Vec<PointView>> {
         out.push(point?);
     }
     Ok(out)
+}
+
+fn views_from_plan(jobs: &[state::PlanJob]) -> Vec<PlanJobView> {
+    let mut out = Vec::new();
+    for job in jobs {
+        out.push(PlanJobView {
+            id: None,
+            parent_id: None,
+            title: job.title.clone(),
+            acceptance: job.acceptance.clone(),
+        });
+        for child in &job.subjobs {
+            out.push(PlanJobView {
+                id: None,
+                parent_id: None,
+                title: child.title.clone(),
+                acceptance: child.acceptance.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn load_job_views(conn: &Connection, id: &str) -> Result<Vec<PlanJobView>> {
@@ -3422,7 +3435,7 @@ mod tests {
             &format!("/v1/items/{nested_id}/submit"),
             json!({
                 "claim_token": token,
-                "document": r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child"}]}]}"#,
+                "document": r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child","subjobs":[{"title":"no"}]}]}]}"#,
             }),
         );
         assert_eq!(
@@ -3431,9 +3444,27 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&rejected.body)
         );
-        assert!(String::from_utf8_lossy(&rejected.body).contains("subjobs"));
+        assert!(String::from_utf8_lossy(&rejected.body).contains("depth 3"));
         assert_eq!(item_state_of(&cfg, nested_id), "planning");
         assert!(!cfg.docs_dir.join(nested_id).join("plan").exists());
+        let accepted = post(
+            &cfg,
+            &format!("/v1/items/{nested_id}/submit"),
+            json!({
+                "claim_token": token,
+                "document": r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child"}]}]}"#,
+            }),
+        );
+        assert_eq!(
+            accepted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&accepted.body)
+        );
+        assert_eq!(item_state_of(&cfg, nested_id), "awaiting_plan_review");
+        let html =
+            fs::read_to_string(cfg.docs_dir.join(nested_id).join("plan").join("r1.html")).unwrap();
+        assert!(html.contains("child"));
 
         let loose = post_item(&cfg, "Loose", "");
         let loose_id = loose["id"].as_str().unwrap().to_string();
