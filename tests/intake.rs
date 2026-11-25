@@ -158,7 +158,7 @@ fn cli_replaces_a_stale_socket_and_publishes_the_card() {
         let _ = fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         drop(listener);
-        let _kill = KillLock(runtime.join("keel.lock"));
+        let _kill = KillLock(tree.root.join("data/keel/default/keel.lock"));
 
         let mut add = keel(bin, &tree.root, port);
         add.args(["add", "--body", "hello <b>", "Card title"]);

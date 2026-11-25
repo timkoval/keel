@@ -5,7 +5,9 @@ use std::io::{Read, Write};
 use crate::db::{Error, Result};
 
 const HEADER_MAX: usize = 16 * 1024;
-const BODY_MAX: usize = 64 * 1024;
+/// Decoded item bodies stop at 32 KiB. A JSON `\uXXXX` escape is 6 bytes per input byte,
+/// plus the title and the rest of the object.
+const BODY_MAX: usize = 32 * 1024 * 6 + 16 * 1024;
 
 #[derive(Debug)]
 pub struct Request {
@@ -127,7 +129,7 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
         }
     }
     if content_length > BODY_MAX {
-        return Err(Error::Invalid("body exceeds 64 KiB".into()));
+        return Err(Error::Invalid("request exceeds the socket body cap".into()));
     }
     let body = read_exact_body(stream, prefetched, content_length)?;
     Ok(Request {
@@ -138,11 +140,7 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
     })
 }
 
-pub fn write_response<S: Write>(
-    stream: &mut S,
-    response: &Response,
-    include_body: bool,
-) -> Result<()> {
+pub fn write_response<S: Write>(stream: &mut S, response: &Response) -> Result<()> {
     let reason = reason(response.status);
     let mut head = format!(
         "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -158,9 +156,7 @@ pub fn write_response<S: Write>(
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
-    if include_body {
-        stream.write_all(&response.body)?;
-    }
+    stream.write_all(&response.body)?;
     stream.flush()?;
     Ok(())
 }
@@ -179,8 +175,6 @@ pub fn read_response<S: Read>(stream: &mut S) -> Result<Response> {
         .parse()
         .map_err(|_| Error::Invalid("bad status code".into()))?;
     let mut content_length = None;
-    let mut content_type = "application/octet-stream";
-    let mut extra = Vec::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -188,17 +182,13 @@ pub fn read_response<S: Read>(stream: &mut S) -> Result<Response> {
         let Some((name, value)) = line.split_once(':') else {
             return Err(Error::Invalid("bad header".into()));
         };
-        let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
             content_length = Some(
                 value
+                    .trim()
                     .parse()
                     .map_err(|_| Error::Invalid("bad content-length".into()))?,
             );
-        } else if name.eq_ignore_ascii_case("content-type") {
-            content_type = value;
-        } else if name.eq_ignore_ascii_case("content-security-policy") {
-            extra.push((name.to_string(), value.to_string()));
         }
     }
     let len =
@@ -206,24 +196,13 @@ pub fn read_response<S: Read>(stream: &mut S) -> Result<Response> {
     if len > 1024 * 1024 {
         return Err(Error::Invalid("response is too large".into()));
     }
-    // content_type is borrowed from head. Copy before moving on.
-    let content_type = content_type.to_string();
     let body = read_exact_body(stream, prefetched, len)?;
     Ok(Response {
         status,
-        content_type: leak_type(content_type),
-        extra,
+        content_type: "application/octet-stream",
+        extra: Vec::new(),
         body,
     })
-}
-
-fn leak_type(content_type: String) -> &'static str {
-    match content_type.as_str() {
-        "application/json" => "application/json",
-        "text/html; charset=utf-8" => "text/html; charset=utf-8",
-        "text/plain; charset=utf-8" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
-    }
 }
 
 fn read_head<S: Read>(stream: &mut S) -> Result<(String, Vec<u8>)> {
@@ -300,11 +279,7 @@ fn percent_decode(value: &str) -> String {
                 }
             }
         }
-        if bytes[i] == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(bytes[i]);
-        }
+        out.push(bytes[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -324,7 +299,6 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
-        413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "Error",
     }
@@ -341,7 +315,7 @@ mod tests {
         write_request(
             &mut buf,
             "POST",
-            "/v1/items?state=inbox",
+            "/v1/items?state=a+b%20c",
             Some(br#"{"title":"a"}"#),
         )
         .unwrap();
@@ -349,15 +323,28 @@ mod tests {
         let req = read_request(&mut cur).unwrap();
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/v1/items");
-        assert_eq!(query(&req.query, "state"), Some("inbox"));
+        assert_eq!(query(&req.query, "state"), Some("a+b c"));
         assert_eq!(req.body, br#"{"title":"a"}"#);
+    }
+
+    #[test]
+    fn socket_cap_accepts_an_escaped_32kib_body() {
+        let body = "\u{1}".repeat(32 * 1024);
+        let payload = serde_json::to_vec(&serde_json::json!({"title": "t", "body": body})).unwrap();
+        assert!(payload.len() > 64 * 1024, "{}", payload.len());
+        assert!(payload.len() <= BODY_MAX, "{}", payload.len());
+        let mut buf = Vec::new();
+        write_request(&mut buf, "POST", "/v1/items", Some(&payload)).unwrap();
+        let mut cur = Cursor::new(buf);
+        let req = read_request(&mut cur).unwrap();
+        assert_eq!(req.body, payload);
     }
 
     #[test]
     fn response_roundtrip() {
         let resp = Response::json(200, serde_json::json!({"ok": true}));
         let mut buf = Vec::new();
-        write_response(&mut buf, &resp, true).unwrap();
+        write_response(&mut buf, &resp).unwrap();
         let mut cur = Cursor::new(buf);
         let got = read_response(&mut cur).unwrap();
         assert_eq!(got.status, 200);

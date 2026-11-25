@@ -184,6 +184,9 @@ fn add(config: &Config, args: &[String]) -> Result<()> {
     )?;
     println!("{}", created["id"].as_str().unwrap_or(""));
     println!("{}", created["card_url"].as_str().unwrap_or(""));
+    if let Some(warning) = created["warning"].as_str() {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -252,15 +255,12 @@ fn is_stale(err: &io::Error) -> bool {
 }
 
 fn start_and_connect(config: &Config) -> Result<UnixStream> {
-    // A live pid owns the database. Replacing its socket would let a second
-    // process open the same file.
-    if daemon::lock_owner_alive(&config.lock_path) {
-        return Err(Error::Invalid(format!(
-            "socket {} is not accepting and the lock pid is live",
-            config.socket_path.display()
-        )));
-    }
+    fs::create_dir_all(&config.data_dir)?;
+    // Same flock the daemon holds. Busy means the owner is alive, even when
+    // the pid text is missing. Release before spawn so the child can take it.
+    let lock = daemon::acquire_lock(&config.lock_path)?;
     let _ = fs::remove_file(&config.socket_path);
+    drop(lock);
     let exe = env::current_exe()?;
     fs::create_dir_all(&config.runtime_dir)?;
     // Null stdout, and a file for stderr. Inheriting the CLI pipes would keep

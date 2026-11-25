@@ -112,7 +112,7 @@ fn resolve(spec: Spec) -> Result<Config> {
         profile,
         port,
         socket_path: runtime_dir.join("keel.sock"),
-        lock_path: runtime_dir.join("keel.lock"),
+        lock_path: data_dir.join("keel.lock"),
         db_path: data_dir.join("keel.db"),
         docs_dir: data_dir.join("docs"),
         data_dir,
@@ -229,7 +229,7 @@ pub(crate) fn isolated(root: &std::path::Path, port: u16) -> Config {
         data_dir: data_dir.clone(),
         runtime_dir: runtime_dir.clone(),
         socket_path: runtime_dir.join("keel.sock"),
-        lock_path: runtime_dir.join("keel.lock"),
+        lock_path: data_dir.join("keel.lock"),
         db_path: data_dir.join("keel.db"),
         docs_dir: data_dir.join("docs"),
         publish_root: root.join("artifacts"),
@@ -291,10 +291,7 @@ mod tests {
             cfg.socket_path,
             PathBuf::from("/run/user/1/keel/work/keel.sock")
         );
-        assert_eq!(
-            cfg.lock_path,
-            PathBuf::from("/run/user/1/keel/work/keel.lock")
-        );
+        assert_eq!(cfg.lock_path, PathBuf::from("/data/keel/work/keel.lock"));
         assert_eq!(cfg.port, 8000);
         assert_eq!(cfg.publish_root, PathBuf::from("/tmp/pub"));
         assert_eq!(cfg.card_url("k_abc"), "http://127.0.0.1:8000/i/k_abc/card");

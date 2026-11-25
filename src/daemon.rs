@@ -52,7 +52,7 @@ struct Shared {
     config: Config,
 }
 
-struct LockGuard {
+pub(crate) struct LockGuard {
     file: File,
     pid: u32,
     start: String,
@@ -60,8 +60,8 @@ struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // Blank our pid before the flock drops so a later start in this same
-        // process is not refused. A crash skips this and leaves a dead pid.
+        // Clear the pid hint before the fd closes. A crash leaves it; the
+        // flock, not the text, is what the next start trusts.
         if let Ok(Some((pid, start))) = read_lock_file(&mut self.file) {
             if pid == self.pid && start == self.start {
                 let _ = self.file.set_len(0);
@@ -71,33 +71,19 @@ impl Drop for LockGuard {
     }
 }
 
-enum Owner {
-    Alive,
-    Dead,
-    /// `/proc` could not be read. Do not steal the database.
-    Unverified,
-}
-
-pub(crate) fn lock_owner_alive(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    match parse_lock(&text) {
-        Some((pid, start)) => matches!(owner_state(pid, &start), Owner::Alive | Owner::Unverified),
-        None => false,
-    }
-}
-
 pub(crate) fn serve(config: &Config, shutdown: &AtomicBool) -> Result<()> {
-    ensure_private_dir(&config.runtime_dir)?;
+    ensure_private_dir(&config.data_dir)?;
+    // Held for the process lifetime. The socket is unlinked only while this
+    // flock is ours, so a second runtime dir cannot open the same database.
     let _lock = acquire_lock(&config.lock_path)?;
-    // The previous owner is dead, or this is the first start. The socket file
-    // is not a listener anymore; replace it.
+    ensure_private_dir(&config.runtime_dir)?;
     let _ = fs::remove_file(&config.socket_path);
     let unix = bind_socket(&config.socket_path)?;
     let tcp = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], config.port))) {
         Ok(listener) => listener,
         Err(err) => {
+            // This process created the listener. A failed bind before that
+            // returns above and leaves the path alone.
             drop(unix);
             let _ = fs::remove_file(&config.socket_path);
             return Err(Error::Io(std::io::Error::new(
@@ -108,7 +94,6 @@ pub(crate) fn serve(config: &Config, shutdown: &AtomicBool) -> Result<()> {
     };
     unix.set_nonblocking(true)?;
     tcp.set_nonblocking(true)?;
-    ensure_private_dir(&config.data_dir)?;
     let db = open(&config.db_path)?;
     let mut db_perms = fs::metadata(&config.db_path)?.permissions();
     db_perms.set_mode(0o600);
@@ -202,57 +187,35 @@ impl Drop for Running {
 }
 
 fn handle_unix(mut stream: UnixStream, shared: Arc<Shared>) {
-    prepare_stream(&stream);
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let req = match http::read_request(&mut stream) {
         Ok(req) => req,
         Err(err) if quiet(&err) => return,
         Err(err) => {
-            let _ = http::write_response(&mut stream, &http::error_response(400, &err), true);
+            let _ = http::write_response(&mut stream, &http::error_response(400, &err));
             return;
         }
     };
-    let include_body = req.method != "HEAD";
     let response = route_unix(&req, &shared);
-    let _ = http::write_response(&mut stream, &response, include_body);
+    let _ = http::write_response(&mut stream, &response);
 }
 
 fn handle_tcp(mut stream: TcpStream, shared: Arc<Shared>) {
-    prepare_stream(&stream);
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let req = match http::read_request(&mut stream) {
         Ok(req) => req,
         Err(err) if quiet(&err) => return,
         Err(err) => {
-            let _ = http::write_response(&mut stream, &http::error_response(400, &err), true);
+            let _ = http::write_response(&mut stream, &http::error_response(400, &err));
             return;
         }
     };
-    let include_body = req.method != "HEAD";
     let response = route_tcp(&req, &shared);
-    let _ = http::write_response(&mut stream, &response, include_body);
-}
-
-fn prepare_stream(stream: &impl Silence) {
-    stream.prepare();
-}
-
-trait Silence {
-    fn prepare(&self);
-}
-
-impl Silence for UnixStream {
-    fn prepare(&self) {
-        let _ = self.set_nonblocking(false);
-        let _ = self.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = self.set_write_timeout(Some(Duration::from_secs(5)));
-    }
-}
-
-impl Silence for TcpStream {
-    fn prepare(&self) {
-        let _ = self.set_nonblocking(false);
-        let _ = self.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = self.set_write_timeout(Some(Duration::from_secs(5)));
-    }
+    let _ = http::write_response(&mut stream, &response);
 }
 
 fn quiet(err: &Error) -> bool {
@@ -273,24 +236,23 @@ fn quiet(err: &Error) -> bool {
 fn route_unix(req: &Request, shared: &Shared) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/v1/items") => create_response(shared, &req.body),
-        ("GET" | "HEAD", "/v1/items") => list_response(shared, http::query(&req.query, "state")),
-        ("GET" | "HEAD", "/v1/status") => status_response(shared),
-        ("GET" | "HEAD", path) if path.starts_with("/v1/items/") => {
+        ("GET", "/v1/items") => list_response(shared, http::query(&req.query, "state")),
+        ("GET", "/v1/status") => status_response(shared),
+        ("GET", path) if path.starts_with("/v1/items/") => {
             let id = &path["/v1/items/".len()..];
             if id.contains('/') || !render::safe_id(id) {
                 return missing(id);
             }
             item_response(shared, id)
         }
-        ("GET" | "HEAD", _) => missing(&req.path),
-        ("POST", _) => missing(&req.path),
+        ("GET" | "POST", _) => missing(&req.path),
         _ => method_not_allowed("GET, POST"),
     }
 }
 
 /// The document port has no create route. Tailscale Serve would forward the whole port.
 fn route_tcp(req: &Request, shared: &Shared) -> Response {
-    if req.method != "GET" && req.method != "HEAD" {
+    if req.method != "GET" {
         return method_not_allowed("GET");
     }
     match req.path.as_str() {
@@ -340,19 +302,16 @@ fn create_response(shared: &Shared, body: &[u8]) -> Response {
             Err(err) => return fail(err),
         }
     };
+    // The row is already committed. A retry has no external_id, so a 500 here
+    // would insert a second inbox item.
+    let mut body = json!({
+        "id": id,
+        "card_url": shared.config.card_url(&id),
+    });
     if let Err(err) = publish_card(shared, &id) {
-        return fail(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("item {id} stored but card was not written: {err}"),
-        )));
+        body["warning"] = json!(format!("card was not written: {err}"));
     }
-    Response::json(
-        200,
-        json!({
-            "id": id,
-            "card_url": shared.config.card_url(&id),
-        }),
-    )
+    Response::json(200, body)
 }
 
 fn intake_from_json(body: &[u8]) -> Result<RawIntake> {
@@ -428,10 +387,10 @@ fn status_response(shared: &Shared) -> Response {
 
 fn card_response(shared: &Shared, id: &str) -> Response {
     let path = shared.config.docs_dir.join(id).join("card.html");
-    if let Ok(text) = fs::read_to_string(&path) {
-        return Response::html(text);
-    }
-    if let Err(err) = publish_card(shared, id) {
+    if path.is_file() {
+        // A committed card whose relpath update failed is still the record.
+        let _ = set_card_relpath(shared, id);
+    } else if let Err(err) = publish_card(shared, id) {
         return fail(err);
     }
     match fs::read_to_string(&path) {
@@ -466,13 +425,9 @@ fn publish_card(shared: &Shared, id: &str) -> Result<()> {
     let canonical = shared.config.docs_dir.join(&card.id).join("card.html");
     // The database lock is not held across the disk write.
     write_atomic(&canonical, html.as_bytes())?;
-    {
-        let conn = lock_db(&shared.db)?;
-        let rel = format!("docs/{}/card.html", card.id);
-        conn.execute(
-            "UPDATE items SET card_relpath = ?1 WHERE id = ?2",
-            params![rel, card.id],
-        )?;
+    // The file is durable. A failed column update is repaired on the next card read.
+    if let Err(err) = set_card_relpath(shared, &card.id) {
+        eprintln!("keel: card {} relpath not recorded: {err}", card.id);
     }
     let published = shared
         .config
@@ -746,6 +701,16 @@ fn card_id(path: &str) -> Option<&str> {
     }
 }
 
+fn set_card_relpath(shared: &Shared, id: &str) -> Result<()> {
+    let rel = format!("docs/{id}/card.html");
+    let conn = lock_db(&shared.db)?;
+    conn.execute(
+        "UPDATE items SET card_relpath = ?1 WHERE id = ?2 AND card_relpath IS NOT ?1",
+        params![rel, id],
+    )?;
+    Ok(())
+}
+
 fn lock_db(db: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>> {
     db.lock()
         .map_err(|_| Error::Invalid("database lock poisoned".into()))
@@ -792,7 +757,9 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn acquire_lock(path: &Path) -> Result<LockGuard> {
+/// Exclusive flock on the sidecar next to `keel.db`. Never replace that inode:
+/// a new file would not conflict with a lock still held on the old one.
+pub(crate) fn acquire_lock(path: &Path) -> Result<LockGuard> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -816,24 +783,6 @@ fn acquire_lock(path: &Path) -> Result<LockGuard> {
             )));
         }
         return Err(err.into());
-    }
-    let existing = read_lock_file(&mut file)?;
-    if let Some((pid, start)) = existing {
-        match owner_state(pid, &start) {
-            // Matching starttime means that process incarnation is still the owner.
-            // PID reuse is the mismatch arm and is not a lock.
-            Owner::Alive => {
-                return Err(Error::Invalid(format!(
-                    "daemon already running (pid {pid})"
-                )));
-            }
-            Owner::Unverified => {
-                return Err(Error::Invalid(format!(
-                    "lock pid {pid} could not be verified"
-                )));
-            }
-            Owner::Dead => {}
-        }
     }
     let pid = std::process::id();
     let start = read_proc_starttime(pid)
@@ -865,18 +814,6 @@ fn parse_lock(text: &str) -> Option<(u32, String)> {
         return None;
     }
     Some((pid, start))
-}
-
-fn owner_state(pid: u32, start: &str) -> Owner {
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(text) => match starttime_after_comm(&text) {
-            Some(actual) if actual == start => Owner::Alive,
-            Some(_) => Owner::Dead,
-            None => Owner::Unverified,
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Owner::Dead,
-        Err(_) => Owner::Unverified,
-    }
 }
 
 pub(crate) fn read_proc_starttime(pid: u32) -> Option<String> {
@@ -951,7 +888,6 @@ mod tests {
     use crate::config::isolated;
     use crate::state::RawIntake;
     use std::os::unix::net::UnixListener as StdUnix;
-    use std::process::Command;
 
     fn api(cfg: &Config, method: &str, path: &str, body: Option<&[u8]>) -> Response {
         let mut stream = UnixStream::connect(&cfg.socket_path).unwrap();
@@ -1000,6 +936,7 @@ mod tests {
     fn dead_pid_and_stale_socket_are_replaced() {
         let _rm = Rm(scratch_dir());
         let cfg = isolated(&_rm.0, free_port());
+        fs::create_dir_all(&cfg.data_dir).unwrap();
         fs::create_dir_all(&cfg.runtime_dir).unwrap();
         fs::write(&cfg.lock_path, "2147483646 1\n").unwrap();
         assert!(!Path::new("/proc/2147483646").exists());
@@ -1018,35 +955,30 @@ mod tests {
     }
 
     #[test]
-    fn live_lock_pid_does_not_open_the_database() {
+    fn held_flock_does_not_open_the_database_or_unlink_the_socket() {
         let _rm = Rm(scratch_dir());
         let cfg = isolated(&_rm.0, free_port());
+        fs::create_dir_all(&cfg.data_dir).unwrap();
         fs::create_dir_all(&cfg.runtime_dir).unwrap();
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id();
-        let start = read_proc_starttime(pid).unwrap();
-        fs::write(&cfg.lock_path, format!("{pid} {start}\n")).unwrap();
+        let held = acquire_lock(&cfg.lock_path).unwrap();
+        let listener = StdUnix::bind(&cfg.socket_path).unwrap();
+        drop(listener);
         let err = match Running::start(cfg.clone()) {
             Err(err) => err,
-            Ok(_running) => panic!("daemon started while the lock pid was live"),
+            Ok(_running) => panic!("daemon started while the database lock was held"),
         };
         assert!(err.to_string().contains("already running"), "{err}");
         assert!(!cfg.db_path.exists());
-        let text = fs::read_to_string(&cfg.lock_path).unwrap();
-        assert!(text.starts_with(&format!("{pid} ")), "{text}");
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(cfg.socket_path.exists());
+        drop(held);
     }
 
     #[test]
-    fn starttime_mismatch_is_not_a_live_lock() {
+    fn second_serve_loses_the_database_flock() {
         let _rm = Rm(scratch_dir());
         let cfg = isolated(&_rm.0, free_port());
-        fs::create_dir_all(&cfg.runtime_dir).unwrap();
-        let real = read_proc_starttime(std::process::id()).unwrap();
-        assert_ne!(real, "1");
-        fs::write(&cfg.lock_path, format!("{} 1\n", std::process::id())).unwrap();
         let running = Running::start(cfg.clone()).unwrap();
+        let real = read_proc_starttime(std::process::id()).unwrap();
         let text = fs::read_to_string(&cfg.lock_path).unwrap();
         assert_eq!(text.trim(), format!("{} {real}", std::process::id()));
         let stop = AtomicBool::new(false);
@@ -1054,6 +986,7 @@ mod tests {
         assert!(again.to_string().contains("already running"), "{again}");
         let text = fs::read_to_string(&cfg.lock_path).unwrap();
         assert_eq!(text.trim(), format!("{} {real}", std::process::id()));
+        assert!(cfg.socket_path.exists());
         drop(running);
     }
 
@@ -1092,6 +1025,11 @@ mod tests {
         assert_eq!(posted.status, 405);
         let sneaky = tcp(&cfg, "POST", "/health", Some(b"{}"));
         assert_eq!(sneaky.status, 405);
+        let head = tcp(&cfg, "HEAD", "/health", None);
+        assert_eq!(head.status, 405);
+        assert!(String::from_utf8_lossy(&head.body).contains("method not allowed"));
+        let head_unix = api(&cfg, "HEAD", "/v1/status", None);
+        assert_eq!(head_unix.status, 405);
         let counts_on_tcp = tcp(&cfg, "GET", "/v1/status", None);
         assert_eq!(counts_on_tcp.status, 404);
 
@@ -1174,6 +1112,24 @@ mod tests {
         );
         assert_eq!(empty.status, 400);
 
+        let rel: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT card_relpath FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rel, format!("docs/{id}/card.html"));
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE items SET card_relpath = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let repaired = tcp(&cfg, "GET", &format!("/i/{id}/card"), None);
+        assert_eq!(repaired.status, 200);
         let rel: String = open(&cfg.db_path)
             .unwrap()
             .query_row(

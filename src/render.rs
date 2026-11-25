@@ -48,6 +48,20 @@ pub struct QueueView {
 
 pub fn card_page(card: &CardView) -> String {
     let doc = card_doc(card);
+    let repo = card.repo.as_deref().filter(|value| !value.is_empty());
+    let branch = card
+        .target_branch
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let repo_branch = escape(&match (repo, branch) {
+        (None, None) => "unset".to_string(),
+        (repo, branch) => format!(
+            "{} / {}",
+            repo.unwrap_or("unset"),
+            branch.unwrap_or("unset")
+        ),
+    });
+    let rev = card.plan_rev.to_string();
     fill(
         CARD,
         &[
@@ -55,10 +69,10 @@ pub fn card_page(card: &CardView) -> String {
             ("title", &escape(&card.title)),
             ("item_id", &escape(&card.id)),
             ("state", &escape(&card.state)),
-            ("rev", &card.plan_rev.to_string()),
+            ("rev", &rev),
             ("source", &escape(&card.source)),
             ("created_at", &escape(&card.created_at)),
-            ("repo_branch", &escape(&repo_branch(card))),
+            ("repo_branch", &repo_branch),
             ("body", &escape(&card.body)),
             ("doc", &json_for_html(&doc)),
         ],
@@ -132,22 +146,6 @@ fn card_doc(card: &CardView) -> Value {
         "diff": Value::Null,
         "verdict": Value::Null,
     })
-}
-
-fn repo_branch(card: &CardView) -> String {
-    let repo = card.repo.as_deref().filter(|value| !value.is_empty());
-    let branch = card
-        .target_branch
-        .as_deref()
-        .filter(|value| !value.is_empty());
-    match (repo, branch) {
-        (None, None) => "unset".into(),
-        (repo, branch) => format!(
-            "{} / {}",
-            repo.unwrap_or("unset"),
-            branch.unwrap_or("unset")
-        ),
-    }
 }
 
 /// One pass. A value that itself contains `{{` is not expanded again.
