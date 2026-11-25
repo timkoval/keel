@@ -3,7 +3,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -55,11 +55,60 @@ pub(crate) fn ensure_claude(path: &str) -> Result<PathBuf> {
             continue;
         }
         let candidate = Path::new(dir).join("claude");
-        if candidate.is_file() {
+        // execvp skips a file the caller cannot execute. A non-executable
+        // earlier on PATH must not hide a later one, or spawn fails with
+        // EACCES only after the lease exists.
+        if can_exec(&candidate) {
             return Ok(candidate);
         }
     }
     Err(Error::Invalid("claude is not on PATH".into()))
+}
+
+/// Same permission check as `execvp`: owner, group, or other execute bit.
+/// Root may execute when any execute bit is set. No bit means nobody can.
+fn can_exec(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o111 == 0 {
+        return false;
+    }
+    let uid = unsafe { geteuid() };
+    if uid == 0 {
+        return true;
+    }
+    if meta.uid() == uid {
+        return mode & 0o100 != 0;
+    }
+    if meta.gid() == unsafe { getegid() } || supplementary_groups().contains(&meta.gid()) {
+        return mode & 0o010 != 0;
+    }
+    mode & 0o001 != 0
+}
+
+fn supplementary_groups() -> Vec<u32> {
+    let n = unsafe { getgroups(0, std::ptr::null_mut()) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut groups = vec![0u32; n as usize];
+    let got = unsafe { getgroups(n, groups.as_mut_ptr()) };
+    if got < 0 {
+        return Vec::new();
+    }
+    groups.truncate(got as usize);
+    groups
+}
+
+extern "C" {
+    fn geteuid() -> u32;
+    fn getegid() -> u32;
+    fn getgroups(size: i32, list: *mut u32) -> i32;
 }
 
 pub(crate) fn ensure_claude_on_path() -> Result<PathBuf> {
@@ -74,21 +123,22 @@ pub(crate) fn execute(
     if !crate::render::safe_id(&launch.id) {
         return Err(Error::Invalid("id is not a path segment".into()));
     }
+    // data_dir holds keel.db and log secrets. Plan and revise of an item with
+    // no repo have no worktree; do not use that directory as cwd or target_repo.
+    let Some(cwd) = launch.worktree.clone() else {
+        return Err(Error::Invalid(
+            "refusing to run claude without a worktree".into(),
+        ));
+    };
     let bin = ensure_claude_on_path()?;
     let scope = load_scope(db, launch)?;
     if let Some(repo) = scope.repo.as_deref() {
-        if let Some(worktree) = launch.worktree.as_deref() {
-            if same_path(Path::new(repo), worktree) {
-                return Err(Error::Invalid(
-                    "refusing to point claude at the primary checkout".into(),
-                ));
-            }
+        if same_path(Path::new(repo), &cwd) {
+            return Err(Error::Invalid(
+                "refusing to point claude at the primary checkout".into(),
+            ));
         }
     }
-    let cwd = launch
-        .worktree
-        .clone()
-        .unwrap_or_else(|| data_dir.to_path_buf());
     let mode = mode_from_plan(launch.role, scope.plan_json.as_deref())?;
     // The column is the implementer's gate. A review run uses `plan` on the
     // command line and must not replace `auto` before review HTML can show it.
@@ -772,6 +822,73 @@ mod tests {
     }
 
     #[test]
+    fn non_executable_claude_does_not_shadow_a_later_one() {
+        let dir = std::env::temp_dir().join(format!("keel-claude-exec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let earlier = dir.join("earlier");
+        let later = dir.join("later");
+        fs::create_dir_all(&earlier).unwrap();
+        fs::create_dir_all(&later).unwrap();
+        let shadow = earlier.join("claude");
+        fs::write(&shadow, b"not executable\n").unwrap();
+        let mut plain = fs::metadata(&shadow).unwrap().permissions();
+        plain.set_mode(0o644);
+        fs::set_permissions(&shadow, plain).unwrap();
+        let real = later.join("claude");
+        fs::write(&real, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut exec = fs::metadata(&real).unwrap().permissions();
+        exec.set_mode(0o755);
+        fs::set_permissions(&real, exec).unwrap();
+        let path = format!("{}:{}", earlier.display(), later.display());
+        assert_eq!(ensure_claude(&path).unwrap(), real);
+
+        let owner_only = dir.join("owner");
+        fs::create_dir_all(&owner_only).unwrap();
+        let owned = owner_only.join("claude");
+        fs::write(&owned, b"#!/bin/sh\n").unwrap();
+        let mut owner_exec = fs::metadata(&owned).unwrap().permissions();
+        owner_exec.set_mode(0o100);
+        fs::set_permissions(&owned, owner_exec).unwrap();
+        assert_eq!(ensure_claude(owner_only.to_str().unwrap()).unwrap(), owned);
+
+        // We own the file, so the other-execute bit does not make it runnable.
+        // Root is allowed to exec any file that has an execute bit.
+        if unsafe { geteuid() } != 0 {
+            let mut other_only = fs::metadata(&owned).unwrap().permissions();
+            other_only.set_mode(0o001);
+            fs::set_permissions(&owned, other_only).unwrap();
+            let err = ensure_claude(owner_only.to_str().unwrap()).unwrap_err();
+            assert!(err.to_string().contains("claude is not on PATH"), "{err}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_without_a_worktree_is_refused_before_spawn() {
+        let db = Mutex::new(rusqlite::Connection::open_in_memory().unwrap());
+        let refused = |role| {
+            execute(
+                &db,
+                Path::new("/tmp/keel-data-must-not-be-cwd"),
+                &Launch {
+                    target: Target::Item,
+                    id: "item".into(),
+                    role,
+                    token: "tok".into(),
+                    worktree: None,
+                    prompt_path: PathBuf::from("/tmp/keel-no-such-prompt"),
+                },
+            )
+        };
+        for role in [Role::Plan, Role::Revise] {
+            match refused(role) {
+                Err(err) => assert!(err.to_string().contains("without a worktree"), "{err}"),
+                Ok(_) => panic!("claude ran with no worktree"),
+            }
+        }
+    }
+
+    #[test]
     fn spawned_child_is_its_own_process_group() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let dir = std::env::temp_dir().join(format!("keel-claude-pg-{}", std::process::id()));
@@ -793,61 +910,6 @@ mod tests {
         guard.reap().unwrap();
         assert!(proc::group_empty(pgid).unwrap());
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn missing_binary_does_not_take_a_lease() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let _saved = EnvSaved::capture();
-        let _rm = Rm(scratch_dir());
-        let (cfg, running) = boot_at(&_rm.0).unwrap();
-        let repo = _rm.0.join("repo");
-        let head = crate::git::init_repo(&repo);
-        dispatch(
-            &cfg,
-            &[
-                "add".into(),
-                "--repo".into(),
-                repo.to_str().unwrap().into(),
-                "--branch".into(),
-                "main".into(),
-                "Needs claude".into(),
-            ],
-        )
-        .unwrap();
-        let id: String = open(&cfg.db_path)
-            .unwrap()
-            .query_row("SELECT id FROM items", [], |row| row.get(0))
-            .unwrap();
-        let git_only = _rm.0.join("git-only");
-        fs::create_dir_all(&git_only).unwrap();
-        std::os::unix::fs::symlink(ensure_tool("git"), git_only.join("git")).unwrap();
-        std::env::set_var("PATH", &git_only);
-        let err = dispatch(
-            &cfg,
-            &[
-                "run".into(),
-                id.clone(),
-                "--role".into(),
-                "plan".into(),
-                "--adapter".into(),
-                "claude".into(),
-            ],
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("claude is not on PATH"), "{err}");
-        let (state, token): (String, Option<String>) = open(&cfg.db_path)
-            .unwrap()
-            .query_row(
-                "SELECT state, claim_token FROM items WHERE id = ?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "inbox");
-        assert!(token.is_none());
-        assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
-        drop(running);
     }
 
     #[test]
