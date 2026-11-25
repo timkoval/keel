@@ -1894,7 +1894,9 @@ mod tests {
             .map(|line| line.as_str().unwrap().to_string())
             .collect();
         assert!(
-            lines.iter().any(|line| line == "user_version: 1"),
+            lines
+                .iter()
+                .any(|line| line == &format!("user_version: {}", db::USER_VERSION)),
             "{lines:?}"
         );
         assert!(lines.iter().any(|line| line == "git: ok"), "{lines:?}");
