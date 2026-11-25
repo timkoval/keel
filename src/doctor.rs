@@ -35,6 +35,10 @@ const PREVIEW_EXT: &[&str] = &[
 ];
 
 /// `keel.db.bak` next to the database. Never under `agent-artifacts`.
+///
+/// The copy lands on a sibling temp file and replaces `keel.db.bak` only after
+/// it is fsynced. A failed step deletes the temp and leaves the previous bak,
+/// including one older than a day. A partial file must not look fresh.
 pub(crate) fn backup_if_stale(conn: &Connection, db_path: &Path) -> Result<()> {
     let bak = backup_path(db_path)?;
     if !backup_is_stale(&bak) {
@@ -43,10 +47,27 @@ pub(crate) fn backup_if_stale(conn: &Connection, db_path: &Path) -> Result<()> {
     if let Some(parent) = bak.parent() {
         fs::create_dir_all(parent)?;
     }
-    conn.backup(rusqlite::MAIN_DB, &bak, None)?;
-    let mut perms = fs::metadata(&bak)?.permissions();
+    let tmp = bak.with_file_name("keel.db.bak.tmp");
+    let result = write_backup(conn, &bak, &tmp);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_backup(conn: &Connection, bak: &Path, tmp: &Path) -> Result<()> {
+    conn.backup(rusqlite::MAIN_DB, tmp, None)?;
+    let mut perms = fs::metadata(tmp)?.permissions();
     perms.set_mode(0o600);
-    fs::set_permissions(&bak, perms)?;
+    fs::set_permissions(tmp, perms)?;
+    let file = fs::OpenOptions::new().write(true).open(tmp)?;
+    file.sync_all()?;
+    fs::rename(tmp, bak)?;
+    if let Some(parent) = bak.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -150,6 +171,7 @@ struct ItemFact {
     state: String,
     repo: Option<String>,
     merged_sha: Option<String>,
+    integrate_sha: Option<String>,
     plan_rev: i64,
     plan: PlanDoc,
     claim_pid: Option<i64>,
@@ -167,6 +189,7 @@ struct JobFact {
     item_id: String,
     state: String,
     review_rev: i64,
+    review_relpath: Option<String>,
     review: ReviewDoc,
     worktree: Option<PathBuf>,
     claim_pid: Option<i64>,
@@ -184,6 +207,7 @@ struct ItemRow {
     state: String,
     repo: Option<String>,
     merged_sha: Option<String>,
+    integrate_sha: Option<String>,
     plan_rev: i64,
     plan_json: Option<String>,
     claim_pid: Option<i64>,
@@ -197,6 +221,7 @@ struct JobRow {
     state: String,
     review_rev: i64,
     review_json: Option<String>,
+    review_relpath: Option<String>,
     base_sha: Option<String>,
     diff_ref: Option<String>,
     updated_at: String,
@@ -210,7 +235,8 @@ fn snapshot(conn: &Connection, config: &Config) -> Result<Snap> {
     let mut item_rows = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, state, repo, merged_sha, plan_rev, plan_json, claim_pid, claim_starttime
+            "SELECT id, state, repo, merged_sha, integrate_sha, plan_rev, plan_json,
+                    claim_pid, claim_starttime
              FROM items ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -219,10 +245,11 @@ fn snapshot(conn: &Connection, config: &Config) -> Result<Snap> {
                 state: row.get(1)?,
                 repo: row.get(2)?,
                 merged_sha: row.get(3)?,
-                plan_rev: row.get(4)?,
-                plan_json: row.get(5)?,
-                claim_pid: row.get(6)?,
-                claim_starttime: row.get(7)?,
+                integrate_sha: row.get(4)?,
+                plan_rev: row.get(5)?,
+                plan_json: row.get(6)?,
+                claim_pid: row.get(7)?,
+                claim_starttime: row.get(8)?,
             })
         })?;
         for row in rows {
@@ -243,6 +270,7 @@ fn snapshot(conn: &Connection, config: &Config) -> Result<Snap> {
             state: row.state,
             repo: row.repo,
             merged_sha: row.merged_sha,
+            integrate_sha: row.integrate_sha,
             plan_rev: row.plan_rev,
             plan,
             claim_pid: row.claim_pid,
@@ -253,8 +281,8 @@ fn snapshot(conn: &Connection, config: &Config) -> Result<Snap> {
     let mut job_rows = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, item_id, title, state, review_rev, review_json, base_sha, diff_ref,
-                    updated_at, worktree, claim_pid, claim_starttime
+            "SELECT id, item_id, title, state, review_rev, review_json, review_relpath,
+                    base_sha, diff_ref, updated_at, worktree, claim_pid, claim_starttime
              FROM jobs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -265,12 +293,13 @@ fn snapshot(conn: &Connection, config: &Config) -> Result<Snap> {
                 state: row.get(3)?,
                 review_rev: row.get(4)?,
                 review_json: row.get(5)?,
-                base_sha: row.get(6)?,
-                diff_ref: row.get(7)?,
-                updated_at: row.get(8)?,
-                worktree: row.get(9)?,
-                claim_pid: row.get(10)?,
-                claim_starttime: row.get(11)?,
+                review_relpath: row.get(6)?,
+                base_sha: row.get(7)?,
+                diff_ref: row.get(8)?,
+                updated_at: row.get(9)?,
+                worktree: row.get(10)?,
+                claim_pid: row.get(11)?,
+                claim_starttime: row.get(12)?,
             })
         })?;
         for row in rows {
@@ -285,6 +314,7 @@ fn snapshot(conn: &Connection, config: &Config) -> Result<Snap> {
             item_id: row.item_id,
             state: row.state,
             review_rev: row.review_rev,
+            review_relpath: row.review_relpath,
             review,
             worktree: row.worktree.map(PathBuf::from),
             claim_pid: row.claim_pid,
@@ -336,12 +366,6 @@ fn review_doc(row: &JobRow) -> ReviewDoc {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let stat = value
-        .get("diff")
-        .and_then(|diff| diff.get("stat"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
     ReviewDoc::Ready(ReviewView {
         item_id: row.item_id.clone(),
         job_id: row.id.clone(),
@@ -353,7 +377,8 @@ fn review_doc(row: &JobRow) -> ReviewDoc {
         verdict,
         base: row.base_sha.clone().unwrap_or_default(),
         head: row.diff_ref.clone().unwrap_or_default(),
-        stat,
+        stat: String::new(),
+        stored: value,
     })
 }
 
@@ -526,26 +551,45 @@ fn documents(config: &Config, snap: &Snap) -> (Vec<String>, Vec<String>, Vec<Rel
                 }
             }
             ReviewDoc::Ready(view) => {
-                if path.is_file() {
+                let recorded = job
+                    .review_relpath
+                    .as_deref()
+                    .is_some_and(|rel| !rel.is_empty());
+                let rel = format!(
+                    "docs/{}/jobs/{}/review/r{}.html",
+                    job.item_id, job.id, view.rev
+                );
+                // A file without review_relpath is not the current revision.
+                // The column is what the next implement prompt reads, and a
+                // partial page left by a crash must be written again.
+                if path.is_file() && recorded {
                     note_existing("review", &job.id, &path, "job_id", &mut html);
                 } else {
-                    let page = render::review_page(view);
-                    match daemon::write_atomic(&path, page.as_bytes()) {
-                        Ok(()) => {
-                            html.push(format!("fixed html: review {} re-rendered", job.id));
-                            updates.push(RelPath {
-                                plan: false,
-                                id: job.id.clone(),
-                                rel: format!(
-                                    "docs/{}/jobs/{}/review/r{}.html",
-                                    job.item_id, job.id, view.rev
-                                ),
-                            });
+                    let view = review_with_stat(&snap.items, view);
+                    let page = render::review_page(&view);
+                    let same = fs::read(&path).ok().as_deref() == Some(page.as_bytes());
+                    if same {
+                        updates.push(RelPath {
+                            plan: false,
+                            id: job.id.clone(),
+                            rel,
+                        });
+                        note_existing("review", &job.id, &path, "job_id", &mut html);
+                    } else {
+                        match daemon::write_atomic(&path, page.as_bytes()) {
+                            Ok(()) => {
+                                html.push(format!("fixed html: review {} re-rendered", job.id));
+                                updates.push(RelPath {
+                                    plan: false,
+                                    id: job.id.clone(),
+                                    rel,
+                                });
+                            }
+                            Err(err) => html.push(format!(
+                                "warn html: review {} re-render failed: {err}",
+                                job.id
+                            )),
                         }
-                        Err(err) => html.push(format!(
-                            "warn html: review {} re-render failed: {err}",
-                            job.id
-                        )),
                     }
                 }
             }
@@ -557,6 +601,30 @@ fn documents(config: &Config, snap: &Snap) -> (Vec<String>, Vec<String>, Vec<Rel
         }
     }
     (html, published, updates)
+}
+
+fn review_with_stat(items: &[ItemFact], view: &ReviewView) -> ReviewView {
+    let mut view = view.clone();
+    view.stat = diff_stat_of(items, &view.item_id, &view.base, &view.head);
+    view
+}
+
+fn diff_stat_of(items: &[ItemFact], item_id: &str, base: &str, head: &str) -> String {
+    if base.is_empty() || head.is_empty() {
+        return String::new();
+    }
+    let Some(repo) = items
+        .iter()
+        .find(|item| item.id == item_id)
+        .and_then(|item| item.repo.as_deref())
+    else {
+        return String::new();
+    };
+    let repo = Path::new(repo);
+    if !repo.is_dir() {
+        return String::new();
+    }
+    git::diff_stat(repo, base, head).unwrap_or_default()
 }
 
 fn note_existing(kind: &str, id: &str, path: &Path, field: &str, html: &mut Vec<String>) {
@@ -816,10 +884,12 @@ fn under_keel(root: &Path, path: &Path) -> bool {
 
 /// Report only. `merged_sha` that is not an ancestor of primary `HEAD`, and a
 /// first-parent Keel merge commit this database does not store. No checkout,
-/// reset, or merge.
+/// reset, or merge. The walk is capped so a long history cannot outlive the
+/// doctor request.
 fn git_lines(items: &[ItemFact]) -> Vec<String> {
     let mut lines = Vec::new();
-    let mut repos: BTreeMap<String, Vec<(String, Option<String>)>> = BTreeMap::new();
+    let mut repos: BTreeMap<String, Vec<(String, Option<String>, Option<String>)>> =
+        BTreeMap::new();
     for item in items {
         let Some(repo) = item.repo.as_ref().filter(|repo| !repo.is_empty()) else {
             if let Some(sha) = item.merged_sha.as_ref().filter(|sha| !sha.is_empty()) {
@@ -830,10 +900,11 @@ fn git_lines(items: &[ItemFact]) -> Vec<String> {
             }
             continue;
         };
-        repos
-            .entry(repo.clone())
-            .or_default()
-            .push((item.id.clone(), item.merged_sha.clone()));
+        repos.entry(repo.clone()).or_default().push((
+            item.id.clone(),
+            item.merged_sha.clone(),
+            item.integrate_sha.clone(),
+        ));
     }
     for (repo, rows) in repos {
         let path = Path::new(&repo);
@@ -842,7 +913,11 @@ fn git_lines(items: &[ItemFact]) -> Vec<String> {
             continue;
         }
         let mut known = Vec::new();
-        for (id, merged) in &rows {
+        let mut recorded_parents = Vec::new();
+        for (id, merged, integrate) in &rows {
+            if let Some(sha) = integrate.as_ref().filter(|sha| !sha.is_empty()) {
+                recorded_parents.push(sha.clone());
+            }
             let Some(sha) = merged.as_ref().filter(|sha| !sha.is_empty()) else {
                 continue;
             };
@@ -857,12 +932,23 @@ fn git_lines(items: &[ItemFact]) -> Vec<String> {
                 )),
             }
         }
-        match git::first_parent_merges(path) {
-            Ok(merges) => {
-                for (sha, subject) in merges {
-                    if subject.contains("keel/") && !known.iter().any(|stored| stored == &sha) {
+        match git::first_parent_commits(path) {
+            Ok(commits) => {
+                for commit in commits {
+                    if commit.parents.len() < 2 || known.iter().any(|stored| stored == &commit.sha)
+                    {
+                        continue;
+                    }
+                    let by_body = mentions_integrate_branch(&commit.message);
+                    let by_parent = commit
+                        .parents
+                        .iter()
+                        .skip(1)
+                        .any(|parent| recorded_parents.iter().any(|stored| stored == parent));
+                    if by_body || by_parent {
                         lines.push(format!(
-                            "warn git: {sha} on {repo} is a keel merge the database does not know about"
+                            "warn git: {} on {repo} is a keel merge the database does not know about",
+                            commit.sha
                         ));
                     }
                 }
@@ -871,6 +957,40 @@ fn git_lines(items: &[ItemFact]) -> Vec<String> {
         }
     }
     lines
+}
+
+/// `keel/<item>/integrate` in the commit message. A subject that merely
+/// mentions `keel/` is not a Keel integrate merge.
+fn mentions_integrate_branch(message: &str) -> bool {
+    let mut rest = message;
+    while let Some(at) = rest.find("keel/") {
+        let boundary = at == 0
+            || rest[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+        let after = &rest[at + "keel/".len()..];
+        if boundary {
+            if let Some(end) = after.find("/integrate") {
+                let id = &after[..end];
+                let tail = &after[end + "/integrate".len()..];
+                let id_ok = !id.is_empty()
+                    && !id.contains('/')
+                    && id
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+                let tail_ok = tail
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+                if id_ok && tail_ok {
+                    return true;
+                }
+            }
+        }
+        rest = after;
+    }
+    false
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1105,6 +1225,137 @@ mod tests {
         let refused = Path::new("/tmp/agent-artifacts/keel.db");
         let err = backup_path(refused).unwrap_err();
         assert!(err.to_string().contains("agent-artifacts"), "{err}");
+        assert!(!bak.with_file_name("keel.db.bak.tmp").exists());
+    }
+
+    #[test]
+    fn failed_backup_leaves_the_previous_bak() {
+        let root = scratch();
+        let _rm = Rm(root.clone());
+        let db_path = root.join("keel.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        backup_if_stale(&conn, &db_path).unwrap();
+        let bak = db_path.with_file_name("keel.db.bak");
+        {
+            let bak_conn = Connection::open(&bak).unwrap();
+            bak_conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+        {
+            let file = fs::OpenOptions::new().write(true).open(&bak).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60))
+                .unwrap();
+        }
+        let tmp = bak.with_file_name("keel.db.bak.tmp");
+        fs::create_dir(&tmp).unwrap();
+        let err = backup_if_stale(&conn, &db_path).unwrap_err();
+        assert!(
+            err.to_string().contains("sqlite") || err.to_string().contains("unable"),
+            "{err}"
+        );
+        let version: i32 = Connection::open(&bak)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        assert!(tmp.is_dir(), "failure must not replace the temp obstacle");
+        assert!(bak.is_file());
+    }
+
+    #[test]
+    fn open_keeps_the_pre_migration_bak() {
+        let root = scratch();
+        let _rm = Rm(root.clone());
+        let path = root.join("keel.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            drop(conn);
+        }
+        let conn = crate::db::open(&path).unwrap();
+        let live: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(live, db::USER_VERSION);
+        let bak = path.with_file_name("keel.db.bak");
+        let bak_conn = Connection::open(&bak).unwrap();
+        let version: i32 = bak_conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        let tables: i64 = bak_conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'items'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "pre-migration bak picked up the new schema");
+        drop(bak_conn);
+        backup_if_stale(&conn, &path).unwrap();
+        let version: i32 = Connection::open(&bak)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0, "daily copy replaced the pre-migration bak");
+    }
+
+    #[test]
+    fn failed_migration_does_not_listen_or_replace_the_pre_migration_bak() {
+        let root = crate::daemon::scratch_dir();
+        let _rm = crate::daemon::Rm(root.clone());
+        let cfg = crate::config::isolated(&root, crate::daemon::free_port());
+        fs::create_dir_all(&cfg.data_dir).unwrap();
+        {
+            let conn = crate::db::open(&cfg.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO items (id, title, body, source, state, created_at, updated_at)
+                 VALUES ('k_mark', 'T', 'B', 'cli', 'inbox', '2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            let conn = Connection::open(&cfg.db_path).unwrap();
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        let bak = cfg.db_path.with_file_name("keel.db.bak");
+        fs::write(&bak, b"previous-good").unwrap();
+        {
+            let file = fs::OpenOptions::new().write(true).open(&bak).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60))
+                .unwrap();
+        }
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let err = crate::daemon::serve(&cfg, &flag).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(
+            !cfg.socket_path.exists(),
+            "failed migration left the socket"
+        );
+        let bak_conn = Connection::open(&bak).unwrap();
+        let version: i32 = bak_conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        let marked: String = bak_conn
+            .query_row("SELECT id FROM items WHERE id = 'k_mark'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(marked, "k_mark");
+        drop(bak_conn);
+        let bytes = fs::read(&bak).unwrap();
+        let err = crate::daemon::serve(&cfg, &flag).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            fs::read(&bak).unwrap(),
+            bytes,
+            "failed migration replaced the pre-migration bak"
+        );
+        assert!(!cfg.socket_path.exists());
+        let live: i32 = Connection::open(&cfg.db_path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(live, 0);
     }
 
     #[test]
@@ -1328,6 +1579,21 @@ mod tests {
             "{joined}"
         );
         assert!(!joined.contains(&side_sha), "{joined}");
+        git(&repo, &["checkout", "-b", "keel/notes"]);
+        fs::write(repo.join("notes"), "n\n").unwrap();
+        git(&repo, &["add", "notes"]);
+        git(&repo, &["commit", "-m", "notes"]);
+        git(&repo, &["checkout", "main"]);
+        git(&repo, &["merge", "--no-ff", "--no-edit", "keel/notes"]);
+        let notes_sha = crate::git::rev_parse(&repo, "HEAD").unwrap();
+        let lines = run(&db, &cfg).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(&format!("{keel_sha} on {} is a keel merge", repo.display())),
+            "{joined}"
+        );
+        assert!(!joined.contains(&notes_sha), "{joined}");
+        assert!(!joined.contains(&side_sha), "{joined}");
         db.lock()
             .unwrap()
             .execute(
@@ -1359,6 +1625,202 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, keel_sha);
+    }
+
+    #[test]
+    fn rewritten_merge_is_found_by_the_recorded_parent() {
+        let (_rm, cfg, db) = fresh();
+        let repo = _rm.0.join("repo");
+        crate::git::init_repo(&repo);
+        let id = add_item(&db, Some(repo.clone()));
+        write_card(&cfg, &id);
+        git(&repo, &["checkout", "-b", &format!("keel/{id}/integrate")]);
+        fs::write(repo.join("leaf"), "x\n").unwrap();
+        git(&repo, &["add", "leaf"]);
+        git(&repo, &["commit", "-m", "leaf"]);
+        let integrate = crate::git::rev_parse(&repo, "HEAD").unwrap();
+        git(&repo, &["checkout", "main"]);
+        git(
+            &repo,
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                &format!("keel/{id}/integrate"),
+            ],
+        );
+        git(&repo, &["commit", "--amend", "-m", "landed the work"]);
+        let amended = crate::git::rev_parse(&repo, "HEAD").unwrap();
+        let lines = run(&db, &cfg).unwrap();
+        assert!(
+            lines.iter().all(|line| !line.contains(&amended)),
+            "{lines:?}"
+        );
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE items SET integrate_sha = ?1 WHERE id = ?2",
+                params![integrate, id],
+            )
+            .unwrap();
+        let lines = run(&db, &cfg).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(&format!("{amended} on {} is a keel merge", repo.display())),
+            "{joined}"
+        );
+        let head = crate::git::rev_parse(&repo, "HEAD").unwrap();
+        assert_eq!(head, amended);
+    }
+
+    #[test]
+    fn keel_merge_past_the_bounded_walk_does_not_stall_doctor() {
+        let (_rm, cfg, db) = fresh();
+        let repo = _rm.0.join("repo");
+        crate::git::init_repo(&repo);
+        let id = add_item(&db, Some(repo.clone()));
+        write_card(&cfg, &id);
+        git(&repo, &["checkout", "-b", &format!("keel/{id}/integrate")]);
+        fs::write(repo.join("leaf"), "x\n").unwrap();
+        git(&repo, &["add", "leaf"]);
+        git(&repo, &["commit", "-m", "leaf"]);
+        git(&repo, &["checkout", "main"]);
+        git(
+            &repo,
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                &format!("keel/{id}/integrate"),
+            ],
+        );
+        let keel_sha = crate::git::rev_parse(&repo, "HEAD").unwrap();
+        for n in 0..(crate::git::FIRST_PARENT_WALK + 5) {
+            git(
+                &repo,
+                &["commit", "--allow-empty", "-m", &format!("pad {n}")],
+            );
+        }
+        let started = std::time::Instant::now();
+        let lines = run(&db, &cfg).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "doctor exceeded its walk budget"
+        );
+        let joined = lines.join("\n");
+        assert!(!joined.contains(&keel_sha), "{joined}");
+    }
+
+    #[test]
+    fn review_html_uses_json_git_stat_and_a_null_relpath_is_not_final() {
+        let (_rm, cfg, db) = fresh();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let head = crate::git::commit_file(&repo, "leaf", b"changed\n");
+        let id = add_item(&db, Some(repo.clone()));
+        write_card(&cfg, &id);
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (
+                    id, item_id, title, acceptance, state, depth, ord, base_sha, diff_ref,
+                    review_rev, review_json, updated_at
+                 ) VALUES (
+                    'j_rev', ?1, 'Leaf', '', 'feedback_pending', 1, 0, ?2, ?3,
+                    1, ?4, '2026-11-25T00:00:00Z'
+                 )",
+                params![
+                    id,
+                    base,
+                    head,
+                    r#"{"verdict":"comments","summary":"ok","findings":["fence is open"],"residual_risk":"none left"}"#
+                ],
+            )
+            .unwrap();
+        let lines = run(&db, &cfg).unwrap();
+        assert!(lines
+            .iter()
+            .any(|line| line == "fixed html: review j_rev re-rendered"));
+        let path = cfg
+            .docs_dir
+            .join(&id)
+            .join("jobs")
+            .join("j_rev")
+            .join("review")
+            .join("r1.html");
+        let html = fs::read_to_string(&path).unwrap();
+        assert!(html.contains("fence is open"), "{html}");
+        assert!(html.contains("none left"), "{html}");
+        let stat = crate::git::diff_stat(&repo, &base, &head).unwrap();
+        assert!(!stat.trim().is_empty(), "{stat}");
+        let doc = embedded_doc(&html).unwrap();
+        assert_eq!(doc["diff"]["base"], base);
+        assert_eq!(doc["diff"]["head"], head);
+        assert_eq!(doc["diff"]["stat"], stat);
+        assert_eq!(doc["findings"][0], "fence is open");
+        assert_eq!(doc["residual_risk"], "none left");
+        let rel: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT review_relpath FROM jobs WHERE id = 'j_rev'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rel.ends_with("review/r1.html"), "{rel}");
+
+        fs::write(&path, b"<html>partial</html>").unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET review_relpath = NULL WHERE id = 'j_rev'",
+                [],
+            )
+            .unwrap();
+        let lines = run(&db, &cfg).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "fixed html: review j_rev re-rendered"),
+            "{lines:?}"
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("fence is open"));
+        let rel: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT review_relpath FROM jobs WHERE id = 'j_rev'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rel.ends_with("review/r1.html"), "{rel}");
+
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET review_relpath = NULL WHERE id = 'j_rev'",
+                [],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let lines = run(&db, &cfg).unwrap();
+        assert!(
+            lines.iter().all(|line| !line.contains("re-rendered")),
+            "{lines:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let rel: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT review_relpath FROM jobs WHERE id = 'j_rev'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rel.ends_with("review/r1.html"), "{rel}");
     }
 
     #[test]

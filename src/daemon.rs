@@ -99,12 +99,22 @@ pub(crate) fn serve(config: &Config, shutdown: &AtomicBool) -> Result<()> {
     };
     unix.set_nonblocking(true)?;
     tcp.set_nonblocking(true)?;
-    let db = open(&config.db_path)?;
+    // Migration runs inside open. A failure must not leave the socket: the
+    // process is not listening, and the pre-migration bak stays put.
+    let db = match open(&config.db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            drop(unix);
+            let _ = fs::remove_file(&config.socket_path);
+            return Err(err);
+        }
+    };
     let mut db_perms = fs::metadata(&config.db_path)?.permissions();
     db_perms.set_mode(0o600);
     fs::set_permissions(&config.db_path, db_perms)?;
     // Beside the database, never under the artifact root. A later restore of
-    // this file is not a git operation and does not move HEAD.
+    // this file is not a git operation and does not move HEAD. Skipped when
+    // open just wrote a pre-migration bak: that mtime is still fresh.
     if let Err(err) = crate::doctor::backup_if_stale(&db, &config.db_path) {
         drop(unix);
         let _ = fs::remove_file(&config.socket_path);

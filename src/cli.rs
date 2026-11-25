@@ -77,7 +77,11 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
         }
         Some("doctor") => {
             no_args("doctor", args)?;
-            let body = daemon_json(config, "GET", "/v1/doctor", None)?;
+            // Status uses 5s. Doctor also walks a bounded first-parent history
+            // and the artifact root, so this request gets a budget that covers
+            // that walk instead of sharing the short one.
+            let body =
+                daemon_json_timeout(config, "GET", "/v1/doctor", None, Duration::from_secs(30))?;
             if let Some(lines) = body.get("lines").and_then(Value::as_array) {
                 for line in lines {
                     println!("{}", line.as_str().unwrap_or(""));
