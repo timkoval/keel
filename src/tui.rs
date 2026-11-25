@@ -5,6 +5,8 @@
 //! after `m` then `M`, and that body never asks for a push.
 
 use std::io::{self, IsTerminal};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -14,7 +16,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::Frame;
 use serde_json::{json, Value};
 
-use crate::cli::{self, daemon_json, daemon_json_timeout};
+use crate::cli::{daemon_json, daemon_json_timeout};
 use crate::config::Config;
 use crate::db::{Error, Result};
 use crate::render;
@@ -63,11 +65,25 @@ pub(crate) enum Key {
 pub(crate) enum Effect {
     Quit,
     Refresh,
-    Open { id: String },
-    Note { id: String, text: String },
-    Approve { id: String, base_sha: String },
-    Merge { id: String },
-    Permit { id: String, choice: String },
+    Open {
+        id: String,
+    },
+    Note {
+        id: String,
+        text: String,
+    },
+    Approve {
+        id: String,
+        base_sha: String,
+    },
+    Merge {
+        id: String,
+    },
+    Permit {
+        kind: Kind,
+        id: String,
+        choice: String,
+    },
 }
 
 pub(crate) struct Call {
@@ -83,6 +99,10 @@ struct App {
     mode: Mode,
     buffer: String,
     message: String,
+    /// Lease GETs only. A note, approve, merge, or permit line stays in `message`.
+    lease_error: Option<String>,
+    /// `xdg-open` children. Reaped with `try_wait` so the event loop does not block.
+    openers: Vec<Child>,
 }
 
 pub fn run(config: &Config) -> Result<()> {
@@ -106,6 +126,8 @@ fn event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        // Non-blocking. A slow opener must not freeze keys or swallow Ctrl-C.
+        reap(app);
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             if app.mode == Mode::Normal {
@@ -190,6 +212,9 @@ fn info_text(app: &App) -> String {
     if !app.message.is_empty() {
         lines.push(app.message.clone());
     }
+    if let Some(err) = &app.lease_error {
+        lines.push(err.clone());
+    }
     lines.join("\n")
 }
 
@@ -200,7 +225,8 @@ fn reload(config: &Config, app: &mut App) -> Result<()> {
     let mut lease_error = None;
     if let Some(leases) = status.get("leases").and_then(Value::as_array) {
         for lease in leases {
-            if lease.get("kind").and_then(Value::as_str) != Some("job") {
+            let kind = lease.get("kind").and_then(Value::as_str);
+            if kind != Some("item") && kind != Some("job") {
                 continue;
             }
             let Some(id) = lease.get("id").and_then(Value::as_str) else {
@@ -210,25 +236,61 @@ fn reload(config: &Config, app: &mut App) -> Result<()> {
                 continue;
             }
             match daemon_json(config, "GET", &format!("/v1/lease/{id}"), None) {
-                Ok(body) => {
-                    if let Some(row) = job_row(&body) {
-                        rows.push(row);
-                    }
-                }
-                Err(err) => lease_error = Some(err.to_string()),
+                Ok(body) => apply_lease(&mut rows, &body),
+                Err(err) => lease_error = Some(one_line(&err.to_string())),
             }
         }
     }
+    // Every lease this pass was fetched. Drop a previous failure without
+    // touching the action summary in `message`.
+    finish_reload(app, rows, lease_error);
+    Ok(())
+}
+
+fn finish_reload(app: &mut App, rows: Vec<Row>, lease_error: Option<String>) {
     let previous = app
         .rows
         .get(app.selected)
         .map(|row| (row.kind, row.id.clone()));
     app.rows = rows;
     app.selected = restored_index(&app.rows, previous);
-    if let Some(err) = lease_error {
-        app.message = one_line(&err);
+    app.lease_error = lease_error;
+}
+
+/// Item leases update the list row. Job leases are their own rows.
+fn apply_lease(rows: &mut Vec<Row>, body: &Value) {
+    match body.get("kind").and_then(Value::as_str) {
+        Some("job") => {
+            if let Some(row) = job_row(body) {
+                rows.push(row);
+            }
+        }
+        Some("item") => {
+            let Some((kind, text)) = waiting_permit(body) else {
+                return;
+            };
+            let Some(id) = body.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.kind == Kind::Item && row.id == id)
+            {
+                row.permit_kind = Some(kind);
+                row.permit_text = Some(text);
+            } else if render::safe_id(id) {
+                rows.push(Row {
+                    kind: Kind::Item,
+                    id: id.to_string(),
+                    state: text_field(body, "state"),
+                    title: text_field(body, "worker_id"),
+                    permit_kind: Some(kind),
+                    permit_text: Some(text),
+                });
+            }
+        }
+        _ => {}
     }
-    Ok(())
 }
 
 fn item_rows(body: &Value) -> Vec<Row> {
@@ -261,21 +323,9 @@ fn job_row(value: &Value) -> Option<Row> {
     if !render::safe_id(id) {
         return None;
     }
-    let pending = value.get("pending_permit").filter(|value| !value.is_null());
-    let waiting = pending
-        .and_then(|pending| pending.get("phase"))
-        .and_then(Value::as_str)
-        == Some("waiting");
-    let (permit_kind, permit_text) = if waiting {
-        let pending = pending.unwrap();
-        let kind = pending
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("permission")
-            .to_string();
-        (Some(kind), Some(format_permit(pending)))
-    } else {
-        (None, None)
+    let (permit_kind, permit_text) = match waiting_permit(value) {
+        Some((kind, text)) => (Some(kind), Some(text)),
+        None => (None, None),
     };
     let worker = value.get("worker_id").and_then(Value::as_str).unwrap_or("");
     Some(Row {
@@ -290,6 +340,21 @@ fn job_row(value: &Value) -> Option<Row> {
         permit_kind,
         permit_text,
     })
+}
+
+fn waiting_permit(value: &Value) -> Option<(String, String)> {
+    let pending = value
+        .get("pending_permit")
+        .filter(|value| !value.is_null())?;
+    if pending.get("phase").and_then(Value::as_str) != Some("waiting") {
+        return None;
+    }
+    let kind = pending
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("permission")
+        .to_string();
+    Some((kind, format_permit(pending)))
 }
 
 /// Display only. The daemon still maps `y` / `n` / `A`.
@@ -361,6 +426,8 @@ impl App {
             mode: Mode::Normal,
             buffer: String::new(),
             message: String::new(),
+            lease_error: None,
+            openers: Vec::new(),
         }
     }
 
@@ -390,7 +457,7 @@ impl App {
             Key::Char('o') => self.open_effect(),
             Key::Char('a') => self.begin_approve(),
             Key::Char('m') => self.arm_merge(),
-            // On a waiting Grok job, n is deny. Otherwise n starts a note.
+            // On a waiting permit, n is deny. Otherwise n starts a note.
             Key::Char(ch @ ('y' | 'n' | 'A')) => {
                 let effects = self.permit(ch);
                 if effects.is_empty() && ch == 'n' {
@@ -527,11 +594,13 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return vec![];
         };
-        if row.kind != Kind::Job || row.permit_kind.is_none() {
+        if row.permit_kind.is_none() {
             return vec![];
         }
         let id = row.id.clone();
+        let kind = row.kind;
         vec![Effect::Permit {
+            kind,
             id,
             choice: choice.to_string(),
         }]
@@ -614,12 +683,18 @@ pub(crate) fn effect_call(effect: &Effect) -> Option<Call> {
             Some(json!({ "continue": false, "abort": false })),
             30,
         ),
-        Effect::Permit { id, choice } if render::safe_id(id) => (
-            "POST",
-            format!("/v1/jobs/{id}/permit"),
-            Some(json!({ "choice": choice })),
-            5,
-        ),
+        Effect::Permit { kind, id, choice } if render::safe_id(id) => {
+            let root = match kind {
+                Kind::Item => "items",
+                Kind::Job => "jobs",
+            };
+            (
+                "POST",
+                format!("/v1/{root}/{id}/permit"),
+                Some(json!({ "choice": choice })),
+                5,
+            )
+        }
         Effect::Open { id } if render::safe_id(id) => ("GET", format!("/v1/items/{id}"), None, 5),
         _ => return None,
     };
@@ -639,7 +714,7 @@ pub(crate) fn open_target(item: &Value) -> Result<String> {
     }
 }
 
-fn open_item(config: &Config, id: &str) -> Result<String> {
+fn open_item(config: &Config, app: &mut App, id: &str) -> Result<String> {
     let call = effect_call(&Effect::Open { id: id.to_string() })
         .ok_or_else(|| Error::NotFound(id.to_string()))?;
     let item = daemon_json_timeout(
@@ -650,8 +725,41 @@ fn open_item(config: &Config, id: &str) -> Result<String> {
         Duration::from_secs(call.timeout_secs),
     )?;
     let url = open_target(&item)?;
-    cli::launch_url(&url)?;
+    // Raw mode has cleared ISIG. Do not inherit the tty or wait on xdg-open.
+    app.openers.push(spawn_detached("xdg-open", &[&url])?);
     Ok(url)
+}
+
+fn spawn_detached(program: &str, args: &[&str]) -> Result<Child> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map_err(Error::Io)
+}
+
+fn reap(app: &mut App) {
+    let mut still = Vec::new();
+    for mut child in app.openers.drain(..) {
+        match child.try_wait() {
+            Ok(None) => still.push(child),
+            _ => {}
+        }
+    }
+    app.openers = still;
+}
+
+extern "C" {
+    fn setsid() -> i32;
 }
 
 fn apply(config: &Config, app: &mut App, effects: Vec<Effect>) -> Result<bool> {
@@ -663,7 +771,7 @@ fn apply(config: &Config, app: &mut App, effects: Vec<Effect>) -> Result<bool> {
                     app.message = one_line(&err.to_string());
                 }
             }
-            Effect::Open { ref id } => match open_item(config, id) {
+            Effect::Open { ref id } => match open_item(config, app, id) {
                 Ok(url) => app.message = format!("opened {url}"),
                 Err(err) => app.message = one_line(&err.to_string()),
             },
@@ -702,15 +810,29 @@ fn summarize(effect: &Effect, value: &Value) -> String {
         Effect::Note { .. } => format!("noted {state}"),
         Effect::Approve { .. } => format!("approved {state}"),
         Effect::Merge { .. } => {
+            let mut line = format!("merge {state}");
             let sha = value
                 .get("merged_sha")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if sha.is_empty() {
-                format!("merge {state}")
-            } else {
-                format!("merge {state} {sha}")
+            if !sha.is_empty() {
+                line.push(' ');
+                line.push_str(sha);
             }
+            // Same facts `keel merge` prints once the integrate worktree is in conflict.
+            if let Some(kind) = value.get("conflict_kind").and_then(Value::as_str) {
+                if !kind.is_empty() {
+                    line.push(' ');
+                    line.push_str(kind);
+                    if let Some(worktree) = value.get("worktree").and_then(Value::as_str) {
+                        if !worktree.is_empty() {
+                            line.push(' ');
+                            line.push_str(worktree);
+                        }
+                    }
+                }
+            }
+            line
         }
         Effect::Permit { choice, .. } => format!("permit {choice}"),
         _ => state.to_string(),
@@ -759,6 +881,8 @@ mod tests {
             mode: Mode::Normal,
             buffer: String::new(),
             message: String::new(),
+            lease_error: None,
+            openers: Vec::new(),
         }
     }
 
@@ -852,6 +976,7 @@ mod tests {
         assert_eq!(
             app.on_key(Key::Char('y')),
             vec![Effect::Permit {
+                kind: Kind::Job,
                 id: "j_perm".into(),
                 choice: "y".into(),
             }]
@@ -859,6 +984,7 @@ mod tests {
         assert_eq!(
             app.on_key(Key::Char('n')),
             vec![Effect::Permit {
+                kind: Kind::Job,
                 id: "j_perm".into(),
                 choice: "n".into(),
             }]
@@ -866,6 +992,7 @@ mod tests {
         assert_eq!(
             app.on_key(Key::Char('A')),
             vec![Effect::Permit {
+                kind: Kind::Job,
                 id: "j_perm".into(),
                 choice: "A".into(),
             }]
@@ -876,6 +1003,7 @@ mod tests {
         assert_eq!(
             app.on_key(Key::Char('2')),
             vec![Effect::Permit {
+                kind: Kind::Job,
                 id: "j_ask".into(),
                 choice: "2".into(),
             }]
@@ -906,12 +1034,20 @@ mod tests {
         assert!(!rendered.contains("grokback"));
 
         let permit = effect_call(&Effect::Permit {
+            kind: Kind::Job,
             id: "j_1".into(),
             choice: "A".into(),
         })
         .unwrap();
         assert_eq!(permit.path, "/v1/jobs/j_1/permit");
         assert_eq!(permit.body.unwrap()["choice"], "A");
+        let item_permit = effect_call(&Effect::Permit {
+            kind: Kind::Item,
+            id: "k_1".into(),
+            choice: "y".into(),
+        })
+        .unwrap();
+        assert_eq!(item_permit.path, "/v1/items/k_1/permit");
 
         let note = effect_call(&Effect::Note {
             id: "k_1".into(),
@@ -936,6 +1072,7 @@ mod tests {
         })
         .is_none());
         assert!(effect_call(&Effect::Permit {
+            kind: Kind::Job,
             id: "../x".into(),
             choice: "y".into(),
         })
@@ -1022,5 +1159,123 @@ mod tests {
             Some(Key::Enter)
         );
         assert_eq!(map_key(KeyCode::Esc, KeyModifiers::NONE), Some(Key::Esc));
+    }
+
+    #[test]
+    fn lease_error_does_not_replace_an_action_line_and_clears_when_every_lease_is_fetched() {
+        let mut view = app(vec![item("k_1", "inbox")]);
+        view.message = "noted revision_requested".into();
+        view.lease_error = Some("stale lease".into());
+        let rows = view.rows.clone();
+        finish_reload(&mut view, rows, Some("daemon 500".into()));
+        assert_eq!(view.message, "noted revision_requested");
+        assert_eq!(view.lease_error.as_deref(), Some("daemon 500"));
+        let text = info_text(&view);
+        assert!(text.contains("noted revision_requested"));
+        assert!(text.contains("daemon 500"));
+        let rows = view.rows.clone();
+        finish_reload(&mut view, rows, None);
+        assert!(view.lease_error.is_none());
+        assert_eq!(view.message, "noted revision_requested");
+        assert!(!info_text(&view).contains("daemon 500"));
+    }
+
+    #[test]
+    fn merge_status_includes_conflict_kind_and_worktree() {
+        let line = summarize(
+            &Effect::Merge { id: "k".into() },
+            &json!({
+                "state": "merge_conflict",
+                "merged_sha": "",
+                "conflict_kind": "integrate",
+                "worktree": "/data/worktrees/k/integrate",
+            }),
+        );
+        assert_eq!(
+            line,
+            "merge merge_conflict integrate /data/worktrees/k/integrate"
+        );
+        let clean = summarize(
+            &Effect::Merge { id: "k".into() },
+            &json!({
+                "state": "merged",
+                "merged_sha": "deadbeef",
+                "conflict_kind": null,
+                "worktree": "/data/worktrees/k/integrate",
+            }),
+        );
+        assert_eq!(clean, "merge merged deadbeef");
+    }
+
+    #[test]
+    fn item_lease_permit_posts_the_item_route() {
+        let mut rows = item_rows(&json!({
+            "items": [{"id": "k_1", "state": "planning", "title": "plan"}]
+        }));
+        apply_lease(
+            &mut rows,
+            &json!({
+                "id": "k_1",
+                "kind": "item",
+                "state": "planning",
+                "worker_id": "grok:018f",
+                "claim_token": "secret-token",
+                "pending_permit": {
+                    "phase": "waiting",
+                    "kind": "permission",
+                    "tool": "bash",
+                    "options": []
+                }
+            }),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].permit_kind.as_deref(), Some("permission"));
+        assert!(!rows[0]
+            .permit_text
+            .as_deref()
+            .unwrap_or("")
+            .contains("secret-token"));
+        let mut view = app(rows);
+        let effects = view.on_key(Key::Char('n'));
+        assert_eq!(
+            effects,
+            vec![Effect::Permit {
+                kind: Kind::Item,
+                id: "k_1".into(),
+                choice: "n".into(),
+            }]
+        );
+        assert_eq!(
+            effect_call(&effects[0]).unwrap().path,
+            "/v1/items/k_1/permit"
+        );
+        apply_lease(
+            &mut view.rows,
+            &json!({
+                "id": "j_1",
+                "kind": "job",
+                "state": "implementing",
+                "pending_permit": {"phase": "waiting", "kind": "permission", "tool": "bash"}
+            }),
+        );
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(view.rows[1].kind, Kind::Job);
+    }
+
+    #[test]
+    fn opener_spawn_returns_before_the_child_exits() {
+        let started = std::time::Instant::now();
+        let child = spawn_detached("sleep", &["30"]).expect("sleep");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut view = app(vec![]);
+        view.message = "opened http://127.0.0.1:7431/i/k_1/card".into();
+        view.openers.push(child);
+        let reaped = std::time::Instant::now();
+        reap(&mut view);
+        assert!(reaped.elapsed() < Duration::from_secs(2));
+        assert_eq!(view.openers.len(), 1);
+        assert_eq!(view.message, "opened http://127.0.0.1:7431/i/k_1/card");
+        view.openers[0].kill().unwrap();
+        view.openers[0].wait().unwrap();
     }
 }
