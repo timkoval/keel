@@ -1904,18 +1904,22 @@ fn load_points(conn: &Connection, id: &str) -> Result<Vec<PointView>> {
 fn views_from_plan(jobs: &[state::PlanJob]) -> Vec<PlanJobView> {
     let mut out = Vec::new();
     for job in jobs {
+        let container = !job.subjobs.is_empty();
         out.push(PlanJobView {
             id: None,
             parent_id: None,
             title: job.title.clone(),
             acceptance: job.acceptance.clone(),
+            container,
         });
+        // No row id yet. The title is what the child points at so the page can indent.
         for child in &job.subjobs {
             out.push(PlanJobView {
                 id: None,
-                parent_id: None,
+                parent_id: Some(job.title.clone()),
                 title: child.title.clone(),
                 acceptance: child.acceptance.clone(),
+                container: false,
             });
         }
     }
@@ -1933,11 +1937,25 @@ fn load_job_views(conn: &Connection, id: &str) -> Result<Vec<PlanJobView>> {
             parent_id: row.get(1)?,
             title: row.get(2)?,
             acceptance: row.get(3)?,
+            container: false,
         })
     })?;
     let mut jobs = Vec::new();
     for job in rows {
         jobs.push(job?);
+    }
+    let parents: Vec<String> = jobs
+        .iter()
+        .filter_map(|job| job.parent_id.clone())
+        .collect();
+    for job in &mut jobs {
+        if job
+            .id
+            .as_ref()
+            .is_some_and(|id| parents.iter().any(|parent| parent == id))
+        {
+            job.container = true;
+        }
     }
     Ok(jobs)
 }
@@ -3465,6 +3483,10 @@ mod tests {
         let html =
             fs::read_to_string(cfg.docs_dir.join(nested_id).join("plan").join("r1.html")).unwrap();
         assert!(html.contains("child"));
+        assert!(html.contains("container"));
+        assert!(html.contains("class=\"sub\""));
+        let doc = keel_doc(&html);
+        assert!(doc["jobs"][1]["parent_id"].as_str() == Some("t"));
 
         let loose = post_item(&cfg, "Loose", "");
         let loose_id = loose["id"].as_str().unwrap().to_string();
