@@ -1,4 +1,4 @@
-//! Card, plan, and queue shells. The daemon is the only writer. Text is escaped.
+//! Card, plan, queue, and board shells. The daemon is the only writer. Text is escaped.
 //! There is no markdown twin and no author JavaScript.
 
 use serde_json::{json, Value};
@@ -7,6 +7,7 @@ const TOKENS: &str = include_str!("../design/tokens.css");
 const CARD: &str = include_str!("../design/card.html");
 const PLAN: &str = include_str!("../design/plan.html");
 const QUEUE: &str = include_str!("../design/queue.html");
+const BOARD: &str = include_str!("../design/board.html");
 
 #[derive(Debug, Clone)]
 pub struct PointView {
@@ -75,6 +76,34 @@ pub struct QueueView {
     /// `plan-review` or `feedback`. Not stored.
     pub name: String,
     pub rows: Vec<QueueLink>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoardJobView {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub parent_id: Option<String>,
+    /// True when another job on this item lists this id as its parent.
+    pub container: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoardItemView {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub card_url: String,
+    pub plan_url: Option<String>,
+    pub jobs: Vec<BoardJobView>,
+    /// Set only for `merge_conflict`. The integrate checkout is a directory.
+    pub integrate_worktree: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoardView {
+    pub columns: Vec<String>,
+    pub items: Vec<BoardItemView>,
 }
 
 pub fn card_page(card: &CardView) -> String {
@@ -173,6 +202,131 @@ pub fn queue_page(queue: &QueueView) -> String {
             ("doc", &json_for_html(&doc)),
         ],
     )
+}
+
+pub fn board_page(board: &BoardView) -> String {
+    let mut columns = String::new();
+    for column in &board.columns {
+        // `dropped` stays on the board but is not an active flow step.
+        if column == "dropped" {
+            columns.push_str("<section class=\"col dropped\">\n");
+        } else {
+            columns.push_str("<section class=\"col\">\n");
+        }
+        columns.push_str("<h2>");
+        columns.push_str(&escape(column));
+        columns.push_str("</h2>\n");
+        for item in board.items.iter().filter(|item| item.state == *column) {
+            columns.push_str(&board_item_html(item));
+        }
+        columns.push_str("</section>\n");
+    }
+    let items: Vec<Value> = board
+        .items
+        .iter()
+        .map(|item| {
+            let jobs: Vec<Value> = item
+                .jobs
+                .iter()
+                .map(|job| {
+                    json!({
+                        "id": job.id,
+                        "title": job.title,
+                        "state": job.state,
+                        "parent_id": job.parent_id,
+                        "container": job.container,
+                    })
+                })
+                .collect();
+            json!({
+                "id": item.id,
+                "title": item.title,
+                "state": item.state,
+                "card_url": item.card_url,
+                "plan_url": item.plan_url,
+                "jobs": jobs,
+            })
+        })
+        .collect();
+    let doc = json!({
+        "keel": 1,
+        "kind": "board",
+        "columns": board.columns,
+        "items": items,
+    });
+    fill(
+        BOARD,
+        &[
+            ("tokens", TOKENS),
+            ("columns", &columns),
+            ("doc", &json_for_html(&doc)),
+        ],
+    )
+}
+
+fn board_item_html(item: &BoardItemView) -> String {
+    let mut out = String::new();
+    out.push_str("<article class=\"card\">\n<h3><a href=\"");
+    out.push_str(&escape(&item.card_url));
+    out.push_str("\">");
+    out.push_str(&escape(&item.title));
+    out.push_str("</a></h3>\n");
+    if let Some(plan) = &item.plan_url {
+        out.push_str("<a class=\"plan\" href=\"");
+        out.push_str(&escape(plan));
+        out.push_str("\">plan</a>\n");
+    }
+    if !item.jobs.is_empty() {
+        out.push_str("<ul class=\"jobs\">\n");
+        for job in &item.jobs {
+            out.push_str(&board_job_html(job));
+        }
+        out.push_str("</ul>\n");
+    }
+    if let Some(path) = &item.integrate_worktree {
+        out.push_str("<p class=\"mono dim worktree\">");
+        out.push_str(&escape(path));
+        out.push_str("</p>\n");
+    }
+    out.push_str("</article>\n");
+    out
+}
+
+fn board_job_html(job: &BoardJobView) -> String {
+    let mut class = String::new();
+    if job.container {
+        class.push_str("label");
+    }
+    if job.parent_id.is_some() {
+        if !class.is_empty() {
+            class.push(' ');
+        }
+        class.push_str("sub");
+    }
+    if job.state == "cancelled" {
+        if !class.is_empty() {
+            class.push(' ');
+        }
+        class.push_str("cancelled");
+    }
+    let mut out = String::new();
+    if class.is_empty() {
+        out.push_str("    <li>");
+    } else {
+        out.push_str("    <li class=\"");
+        out.push_str(&class);
+        out.push_str("\">");
+    }
+    // A container is a grouping label. Its own state is not an implementing chip.
+    if !job.container {
+        out.push_str("<span class=\"chip\">");
+        out.push_str(&escape(&job.state));
+        out.push_str("</span>");
+    }
+    out.push_str("<span class=\"grow\">");
+    out.push_str(&escape(&job.title));
+    out.push_str("</span></li>\n");
+    out
 }
 
 fn plan_doc(plan: &PlanView) -> Value {
@@ -452,6 +606,121 @@ mod tests {
         let doc = doc_json(&html);
         assert_eq!(doc["jobs"][1]["parent_id"], "box");
         assert!(doc["jobs"][0]["parent_id"].is_null());
+    }
+
+    #[test]
+    fn board_indents_a_leaf_and_does_not_chip_its_container() {
+        let columns = [
+            "inbox",
+            "planning",
+            "awaiting_plan_review",
+            "revision_requested",
+            "revising",
+            "awaiting_implementation",
+            "implementing",
+            "awaiting_merge",
+            "merge_conflict",
+            "merged",
+            "dropped",
+        ];
+        let html = board_page(&BoardView {
+            columns: columns.iter().map(|name| (*name).to_string()).collect(),
+            items: vec![
+                BoardItemView {
+                    id: "k_box".into(),
+                    title: "Pin <walk>".into(),
+                    state: "inbox".into(),
+                    card_url: "http://127.0.0.1:7431/i/k_box/card".into(),
+                    plan_url: Some("http://127.0.0.1:7431/i/k_box/plan".into()),
+                    integrate_worktree: None,
+                    jobs: vec![
+                        BoardJobView {
+                            id: "j_box".into(),
+                            title: "Hold".into(),
+                            state: "implementing".into(),
+                            parent_id: None,
+                            container: true,
+                        },
+                        BoardJobView {
+                            id: "j_leaf".into(),
+                            title: "Leaf <x>".into(),
+                            state: "queued".into(),
+                            parent_id: Some("j_box".into()),
+                            container: false,
+                        },
+                        BoardJobView {
+                            id: "j_stop".into(),
+                            title: "Stop".into(),
+                            state: "cancelled".into(),
+                            parent_id: Some("j_box".into()),
+                            container: false,
+                        },
+                    ],
+                },
+                BoardItemView {
+                    id: "k_merge".into(),
+                    title: "Stuck".into(),
+                    state: "merge_conflict".into(),
+                    card_url: "http://127.0.0.1:7431/i/k_merge/card".into(),
+                    plan_url: None,
+                    integrate_worktree: Some("/tmp/keel/worktrees/k_merge/integrate".into()),
+                    jobs: vec![],
+                },
+            ],
+        });
+        assert!(html.contains("script-src 'none'"));
+        assert!(html.contains("http-equiv=\"refresh\" content=\"30\""));
+        assert!(html.contains("<section class=\"col dropped\">"));
+        assert!(!html.to_ascii_lowercase().contains("<form"));
+        assert!(!html.to_ascii_lowercase().contains("<button"));
+        assert_eq!(script_count(&html), 1);
+        let mut last = 0;
+        for name in columns {
+            let at = html.find(&format!("<h2>{name}</h2>")).unwrap();
+            assert!(at >= last, "{name}");
+            last = at;
+        }
+        assert!(html.contains("Pin &lt;walk&gt;"));
+        assert!(html.contains("http://127.0.0.1:7431/i/k_box/card"));
+        assert!(html.contains("http://127.0.0.1:7431/i/k_box/plan"));
+        assert!(html.contains("Leaf &lt;x&gt;"));
+        assert!(html.contains("<li class=\"sub\">"));
+        assert!(html.contains("<span class=\"chip\">queued</span>"));
+        assert!(!html.contains("<span class=\"chip\">implementing</span>"));
+        assert!(html.contains("class=\"sub cancelled\""));
+        assert!(html.contains("padding-left: 1.25rem"));
+        assert!(html.contains("/tmp/keel/worktrees/k_merge/integrate"));
+        let doc = doc_json(&html);
+        assert_eq!(doc["keel"], 1);
+        assert_eq!(doc["kind"], "board");
+        assert_eq!(doc["columns"].as_array().unwrap().len(), columns.len());
+        assert_eq!(doc["columns"][0], "inbox");
+        assert_eq!(doc["columns"][10], "dropped");
+        assert_eq!(doc["items"][0]["title"], "Pin <walk>");
+        assert_eq!(doc["items"][0]["jobs"][0]["container"], true);
+        assert_eq!(doc["items"][0]["jobs"][0]["state"], "implementing");
+        assert!(doc["items"][0]["jobs"][0]["parent_id"].is_null());
+        assert_eq!(doc["items"][0]["jobs"][1]["parent_id"], "j_box");
+        assert_eq!(doc["items"][0]["jobs"][1]["container"], false);
+        assert_eq!(
+            doc["items"][0]["plan_url"],
+            "http://127.0.0.1:7431/i/k_box/plan"
+        );
+        assert!(doc["items"][1]["plan_url"].is_null());
+    }
+
+    fn script_count(html: &str) -> usize {
+        let mut rest = html;
+        let mut count = 0;
+        while let Some(idx) = rest.find("<script") {
+            count += 1;
+            assert!(
+                rest[idx..].starts_with("<script type=\"application/json\" id=\"keel-doc\">"),
+                "executable script"
+            );
+            rest = &rest[idx + 7..];
+        }
+        count
     }
 
     fn doc_json(html: &str) -> Value {

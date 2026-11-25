@@ -129,6 +129,54 @@ fn exchange(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
 }
 
 #[test]
+fn url_board_prints_a_url_ending_in_board() {
+    let tree = scratch();
+    let bin = env!("CARGO_BIN_EXE_keel");
+    fs::create_dir_all(tree.root.join("bin")).unwrap();
+    fs::write(
+        tree.root.join("bin/xdg-open"),
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$KEEL_OPEN_LOG\"\n",
+    )
+    .unwrap();
+    let mut perms = fs::metadata(tree.root.join("bin/xdg-open"))
+        .unwrap()
+        .permissions();
+    #[allow(clippy::permissions_set_readonly)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        fs::set_permissions(tree.root.join("bin/xdg-open"), perms).unwrap();
+    }
+    let port = free_port();
+    write_config(&tree.root, port);
+    let mut url_cmd = keel(bin, &tree.root, port);
+    url_cmd.args(["url", "--board"]);
+    let output = run(url_cmd);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let printed = printed.trim();
+    assert_eq!(printed, format!("http://127.0.0.1:{port}/board"));
+    assert!(printed.ends_with("/board"));
+
+    let mut open_cmd = keel(bin, &tree.root, port);
+    open_cmd.args(["open", "--board"]);
+    let opened = run(open_cmd);
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let opened_out = String::from_utf8(opened.stdout).unwrap();
+    assert_eq!(opened_out.trim(), printed);
+    let log = fs::read_to_string(tree.root.join("opened")).unwrap();
+    assert_eq!(log.trim(), printed);
+}
+
+#[test]
 fn cli_replaces_a_stale_socket_and_publishes_the_card() {
     let tree = scratch();
     let bin = env!("CARGO_BIN_EXE_keel");

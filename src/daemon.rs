@@ -25,7 +25,8 @@ use crate::db::{open, Error, Result};
 use crate::http::{self, Request, Response};
 use crate::proc;
 use crate::render::{
-    self, CardView, PlanJobView, PlanSection, PlanView, PointView, QueueLink, QueueView,
+    self, BoardItemView, BoardJobView, BoardView, CardView, PlanJobView, PlanSection, PlanView,
+    PointView, QueueLink, QueueView,
 };
 use crate::state::{self, RawIntake};
 
@@ -532,6 +533,7 @@ fn route_tcp(req: &Request, shared: &Shared) -> Response {
     }
     match req.path.as_str() {
         "/health" => Response::json(200, json!({ "ok": true })),
+        "/board" => board_response(shared),
         "/queue/plan-review" => queue_response(shared, QueueKind::Plan),
         "/queue/feedback" => queue_response(shared, QueueKind::Feedback),
         other => match doc_route(other) {
@@ -1179,6 +1181,105 @@ fn card_response(shared: &Shared, id: &str) -> Response {
         Ok(text) => Response::html(text),
         Err(err) => fail(err.into()),
     }
+}
+
+fn board_response(shared: &Shared) -> Response {
+    let view = {
+        let conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match load_board(&conn, &shared.config) {
+            Ok(view) => view,
+            Err(err) => return fail(err),
+        }
+    };
+    Response::html(render::board_page(&view))
+}
+
+fn load_board(conn: &Connection, config: &Config) -> Result<BoardView> {
+    let mut stmt =
+        conn.prepare("SELECT id, title, state, plan_rev FROM items ORDER BY updated_at, id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, title, state_name, plan_rev) = row?;
+        if !render::safe_id(&id) {
+            continue;
+        }
+        let plan_url = if plan_rev >= 1 {
+            Some(config.plan_url(&id))
+        } else {
+            None
+        };
+        // Merge keeps this checkout on disk. There is no path column to migrate.
+        let integrate_worktree = if state_name == "merge_conflict" {
+            Some(
+                config
+                    .data_dir
+                    .join("worktrees")
+                    .join(&id)
+                    .join("integrate")
+                    .display()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        items.push(BoardItemView {
+            id: id.clone(),
+            title,
+            state: state_name,
+            card_url: config.card_url(&id),
+            plan_url,
+            jobs: load_board_jobs(conn, &id)?,
+            integrate_worktree,
+        });
+    }
+    Ok(BoardView {
+        columns: ITEM_STATES
+            .iter()
+            .map(|state| (*state).to_string())
+            .collect(),
+        items,
+    })
+}
+
+fn load_board_jobs(conn: &Connection, item_id: &str) -> Result<Vec<BoardJobView>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_job_id, title, state
+         FROM jobs WHERE item_id = ?1 ORDER BY ord, id",
+    )?;
+    let rows = stmt.query_map(params![item_id], |row| {
+        Ok(BoardJobView {
+            id: row.get(0)?,
+            title: row.get(2)?,
+            state: row.get(3)?,
+            parent_id: row.get(1)?,
+            container: false,
+        })
+    })?;
+    let mut jobs = Vec::new();
+    for job in rows {
+        jobs.push(job?);
+    }
+    let parents: Vec<String> = jobs
+        .iter()
+        .filter_map(|job| job.parent_id.clone())
+        .collect();
+    for job in &mut jobs {
+        if parents.iter().any(|parent| parent == &job.id) {
+            job.container = true;
+        }
+    }
+    Ok(jobs)
 }
 
 fn queue_response(shared: &Shared, kind: QueueKind) -> Response {
@@ -2472,6 +2573,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rel, format!("docs/{id}/card.html"));
+        drop(running);
+    }
+
+    #[test]
+    fn board_lists_every_column_and_rejects_post() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let created = post_item(&cfg, "Pin <walk>", "body");
+        let id = created["id"].as_str().unwrap().to_string();
+        let stuck = post_item(&cfg, "Stuck", "body");
+        let stuck_id = stuck["id"].as_str().unwrap().to_string();
+        {
+            let conn = open(&cfg.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, item_id, parent_job_id, title, acceptance, state, depth, ord, updated_at)
+                 VALUES ('j_box', ?1, NULL, 'Hold', '', 'implementing', 1, 0, '2026-11-25T00:00:00Z'),
+                        ('j_leaf', ?1, 'j_box', 'Leaf <x>', '', 'queued', 2, 1, '2026-11-25T00:00:00Z')",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE items SET state = 'merge_conflict', plan_rev = 1 WHERE id = ?1",
+                params![stuck_id],
+            )
+            .unwrap();
+        }
+        let board = tcp(&cfg, "GET", "/board", None);
+        assert_eq!(board.status, 200);
+        let html = String::from_utf8(board.body).unwrap();
+        for name in ITEM_STATES {
+            assert!(
+                html.contains(&format!("<h2>{name}</h2>")),
+                "missing column {name}"
+            );
+        }
+        assert!(html.contains("<section class=\"col dropped\">"));
+        assert!(html.contains("Pin &lt;walk&gt;"));
+        assert!(html.contains(&format!("/i/{id}/card")));
+        assert!(html.contains("Leaf &lt;x&gt;"));
+        assert!(html.contains("<li class=\"sub\">"));
+        assert!(html.contains("<span class=\"chip\">queued</span>"));
+        assert!(!html.contains("<span class=\"chip\">implementing</span>"));
+        assert!(html.contains(
+            &cfg.data_dir
+                .join("worktrees")
+                .join(&stuck_id)
+                .join("integrate")
+                .display()
+                .to_string()
+        ));
+        assert!(html.contains(&format!("/i/{stuck_id}/plan")));
+        assert!(!html.to_ascii_lowercase().contains("<form"));
+        assert!(!html.to_ascii_lowercase().contains("<button"));
+        let mut rest = html.as_str();
+        let mut scripts = 0;
+        while let Some(idx) = rest.find("<script") {
+            scripts += 1;
+            assert!(rest[idx..].starts_with("<script type=\"application/json\" id=\"keel-doc\">"));
+            rest = &rest[idx + 7..];
+        }
+        assert_eq!(scripts, 1);
+        let doc = keel_doc(&html);
+        assert_eq!(doc["kind"], "board");
+        assert_eq!(doc["columns"].as_array().unwrap().len(), ITEM_STATES.len());
+        let item = doc["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap();
+        assert_eq!(item["jobs"][0]["container"], true);
+        assert_eq!(item["jobs"][1]["parent_id"], "j_box");
+        assert_eq!(item["jobs"][1]["container"], false);
+        assert!(item["plan_url"].is_null());
+
+        let posted = tcp(&cfg, "POST", "/board", Some(b"{}"));
+        assert_eq!(posted.status, 405);
+        assert!(String::from_utf8_lossy(&posted.body).contains("method not allowed"));
         drop(running);
     }
 

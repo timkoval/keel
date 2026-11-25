@@ -39,6 +39,10 @@ impl Config {
     pub fn origin(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+
+    pub fn board_url(&self) -> String {
+        format!("{}/board", self.origin())
+    }
 }
 
 /// Values that override `config.toml`. Empty optional fields mean "not set".
