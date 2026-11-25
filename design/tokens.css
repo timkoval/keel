@@ -1,0 +1,114 @@
+:root {
+  color-scheme: dark;
+  --bg: #0B0D10;          /* SPEC §6 */
+  --bg-elev: #14181E;     /* Keel */
+  --text: #E7E4DC;        /* Keel */
+  --text-dim: #9AA3AD;    /* Keel */
+  --line: #2A3138;        /* Keel */
+  --green: #B6D96A;       /* Keel, muted */
+  --amber: #E0A45A;       /* Keel, muted */
+  --danger: #E06B6B;      /* Keel */
+  --font-body: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Iosevka", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --text-size: 1.0625rem;
+  --measure: 40rem;
+  --pad: 1rem;
+  --row: 2.25rem;
+}
+
+* { box-sizing: border-box; }
+
+html { color-scheme: dark; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-size);
+  line-height: 1.45;
+}
+
+.top {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  min-height: var(--row);
+  padding: 0.45rem var(--pad);
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { font-weight: 700; letter-spacing: 0.01em; }
+
+.mono, .id {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.dim { color: var(--text-dim); }
+
+.chip {
+  color: var(--amber);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 0.45rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+main {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: var(--pad);
+}
+
+h1 {
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0 0 0.8rem;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: 7.5rem 1fr;
+  gap: 0.2rem 0.75rem;
+  margin: 0 0 1rem;
+}
+
+dt { color: var(--text-dim); }
+
+dd { margin: 0; }
+
+pre.body {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-body);
+  font-size: var(--text-size);
+}
+
+.queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.queue a {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  min-height: var(--row);
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.queue a:hover { color: var(--green); }
+
+.queue .grow { flex: 1; min-width: 0; }

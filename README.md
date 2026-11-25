@@ -1,6 +1,8 @@
 # Keel
 
-Keel is the local pipeline from an inbox item to a local merge. This crate is the SQLite schema (`user_version` 1) and the item and job transitions. The daemon and the CLI are not here yet.
+Keel is the local pipeline from an inbox item to a local merge. This crate is the SQLite schema (`user_version` 1), the item and job transitions, and the local daemon.
+
+`keel serve` listens on a Unix socket and on `127.0.0.1` for GET document routes. `keel add` is the intake path. `keel inbox`, `keel list`, `keel show`, `keel url`, `keel open`, and `keel status` talk to the socket. They do not open SQLite.
 
 Design: `~/agent-artifacts/shared/plans/keel.md`
 
