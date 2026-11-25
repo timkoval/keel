@@ -8,6 +8,7 @@ pub mod cli;
 pub(crate) mod config;
 pub(crate) mod daemon;
 pub mod db;
+pub(crate) mod doctor;
 pub(crate) mod git;
 pub(crate) mod http;
 pub(crate) mod mcp;

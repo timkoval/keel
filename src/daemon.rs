@@ -103,6 +103,13 @@ pub(crate) fn serve(config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let mut db_perms = fs::metadata(&config.db_path)?.permissions();
     db_perms.set_mode(0o600);
     fs::set_permissions(&config.db_path, db_perms)?;
+    // Beside the database, never under the artifact root. A later restore of
+    // this file is not a git operation and does not move HEAD.
+    if let Err(err) = crate::doctor::backup_if_stale(&db, &config.db_path) {
+        drop(unix);
+        let _ = fs::remove_file(&config.socket_path);
+        return Err(err);
+    }
     let shared = Arc::new(Shared {
         db: Mutex::new(db),
         config: config.clone(),
@@ -256,6 +263,7 @@ fn route_unix(req: &Request, shared: &Arc<Shared>) -> Response {
         ("GET", "/v1/status") => status_response(shared),
         ("GET", "/v1/queues/plan-review") => queue_json_response(shared, QueueKind::Plan),
         ("GET", "/v1/queues/feedback") => queue_json_response(shared, QueueKind::Feedback),
+        ("GET", "/v1/doctor") => doctor_response(shared),
         ("GET", "/v1/resolve") => resolve_response(shared, http::query(&req.query, "id")),
         ("POST", path) => match action_route(path) {
             Some((target, id, action)) => mutate_response(shared, req, target, id, action),
@@ -1157,6 +1165,13 @@ fn item_response(shared: &Shared, id: &str) -> Response {
     };
     match load_item_json(&conn, id, &shared.config) {
         Ok(item) => Response::json(200, item),
+        Err(err) => fail(err),
+    }
+}
+
+fn doctor_response(shared: &Shared) -> Response {
+    match crate::doctor::run(&shared.db, &shared.config) {
+        Ok(lines) => Response::json(200, json!({ "lines": lines })),
         Err(err) => fail(err),
     }
 }
@@ -2114,7 +2129,7 @@ fn publish_plan(shared: &Shared, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_plan(conn: &Connection, id: &str, config: &Config) -> Result<Option<PlanView>> {
+pub(crate) fn load_plan(conn: &Connection, id: &str, config: &Config) -> Result<Option<PlanView>> {
     let row = conn
         .query_row(
             "SELECT id, title, state, summary, plan_rev, plan_json, updated_at
@@ -2333,7 +2348,7 @@ fn lock_db(db: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connectio
         .map_err(|_| Error::Invalid("database lock poisoned".into()))
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

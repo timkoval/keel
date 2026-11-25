@@ -10,7 +10,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (2, include_str!("../migrations/002_claim_snapshot.sql")),
 ];
 
-const LATEST: i32 = 2;
+pub(crate) const USER_VERSION: i32 = 2;
+
+const LATEST: i32 = USER_VERSION;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
