@@ -2,7 +2,6 @@
 //! writes the row. A conflict error carries the current state (HTTP 409).
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -11,8 +10,20 @@ use crate::db::{Error, Result};
 const BODY_MAX: usize = 32 * 1024;
 const TITLE_MAX_CHARS: usize = 120;
 const DOC_MAX: usize = 256 * 1024;
-const LEASE_SECS: u64 = 15 * 60;
 const MAX_LEASES: i64 = 4;
+
+const CLEAR_CLAIM_COLS: &str = "\
+claim_worker = NULL, claim_token = NULL, claim_role = NULL, claim_external = 0, \
+claim_pid = NULL, claim_pgid = NULL, claim_starttime = NULL, lease_until = NULL";
+
+const CLEAR_JOB_LEASE_COLS: &str = "\
+blocked_reason = NULL, pending_permit = NULL, \
+claim_worker = NULL, claim_token = NULL, claim_role = NULL, claim_external = 0, \
+claim_pid = NULL, claim_pgid = NULL, claim_starttime = NULL, lease_until = NULL";
+
+const SET_CLAIM_COLS: &str = "\
+claim_worker = ?3, claim_token = ?4, claim_role = ?5, claim_external = ?6, \
+claim_pid = ?7, claim_pgid = ?8, claim_starttime = ?9, lease_until = ?10";
 
 const HUMAN: &str = "human";
 const DISPATCHER: &str = "dispatcher";
@@ -137,6 +148,40 @@ pub enum ReleaseCause {
     Expiry,
 }
 
+/// One release or expiry. The pid fact, the optional MCP token, and the row
+/// update run in the same immediate transaction.
+#[derive(Clone, Debug)]
+pub struct Release {
+    pub cause: ReleaseCause,
+    /// Human `keel release --force` for a live external pid. MCP has no force.
+    pub force: bool,
+    /// MCP release sends the token. A human release may omit it.
+    pub claim_token: Option<String>,
+    /// Caller observed the recorded pid is dead, or its starttime no longer matches.
+    /// For a spawned child this is `kill(-pgid, 0) == ESRCH`.
+    pub pid_gone: bool,
+}
+
+impl Release {
+    pub fn human() -> Self {
+        Self {
+            cause: ReleaseCause::Human,
+            force: false,
+            claim_token: None,
+            pid_gone: false,
+        }
+    }
+
+    pub fn expiry(pid_gone: bool) -> Self {
+        Self {
+            cause: ReleaseCause::Expiry,
+            force: false,
+            claim_token: None,
+            pid_gone,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictKind {
     Integrate,
@@ -249,12 +294,16 @@ struct Item {
     target_branch: Option<String>,
     plan_json: Option<String>,
     claim_token: Option<String>,
+    claim_external: bool,
+    claim_pid: Option<i64>,
 }
 
 struct Job {
     item_id: String,
     state: JobState,
     claim_token: Option<String>,
+    claim_external: bool,
+    claim_pid: Option<i64>,
     implementer_worker: Option<String>,
     blocked_reason: Option<String>,
 }
@@ -287,7 +336,7 @@ pub fn create_item(conn: &mut Connection, raw: RawIntake) -> Result<String> {
             }
         }
         let id = new_id("k")?;
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         tx.execute(
             "INSERT INTO items (
                 id, title, body, source, external_id, repo, target_branch,
@@ -335,10 +384,11 @@ pub fn claim_item(conn: &mut Connection, item_id: &str, spec: ClaimSpec) -> Resu
                 ));
             }
         };
-        let claim = write_item_claim(tx, item_id, &spec, next)?;
+        let now = sql_now(tx)?;
+        let claim = write_item_claim(tx, item_id, &spec, next, &now)?;
         event(
             tx,
-            &now_rfc3339(),
+            &now,
             DISPATCHER,
             Some(item_id),
             None,
@@ -412,8 +462,8 @@ pub fn claim_job(conn: &mut Connection, job_id: &str, spec: ClaimSpec) -> Result
                 ));
             }
         };
-        let now = now_rfc3339();
-        let claim = insert_claim_fields(&spec)?;
+        let now = sql_now(tx)?;
+        let claim = insert_claim_fields(tx, &spec)?;
         let implementer = if spec.role == Role::Implement {
             Some(spec.worker_id.as_str())
         } else {
@@ -424,22 +474,19 @@ pub fn claim_job(conn: &mut Connection, job_id: &str, spec: ClaimSpec) -> Result
         } else {
             None
         };
-        tx.execute(
+        let sql = format!(
             "UPDATE jobs SET
                 state = ?1,
                 updated_at = ?2,
-                claim_worker = ?3,
-                claim_token = ?4,
-                claim_role = ?5,
-                claim_external = ?6,
-                claim_pid = ?7,
-                claim_pgid = ?8,
-                claim_starttime = ?9,
-                lease_until = ?10,
+                {SET_CLAIM_COLS},
                 blocked_reason = NULL,
+                pending_permit = NULL,
                 implementer_worker = COALESCE(?11, implementer_worker),
                 reviewer_worker = COALESCE(?12, reviewer_worker)
-             WHERE id = ?13",
+             WHERE id = ?13"
+        );
+        tx.execute(
+            &sql,
             params![
                 next.as_str(),
                 now,
@@ -485,14 +532,16 @@ pub fn claim_job(conn: &mut Connection, job_id: &str, spec: ClaimSpec) -> Result
     })
 }
 
-/// Clears the claim and applies the release edge.
-/// Signaling the process group and removing a worktree stay in the caller.
-pub fn release_item(conn: &mut Connection, item_id: &str, cause: ReleaseCause) -> Result<()> {
+pub fn release_item(conn: &mut Connection, item_id: &str, release: Release) -> Result<()> {
     with_tx(conn, |tx| {
         let item = load_item(tx, item_id)?;
-        if item.claim_token.is_none() {
-            return Err(conflict(item.state, "item is not claimed"));
-        }
+        let held = held_lease(
+            item.claim_token.as_deref(),
+            item.claim_external,
+            item.claim_pid,
+        )
+        .ok_or_else(|| conflict(item.state, "item is not claimed"))?;
+        let (actor, kind) = authorize_release(&held, &release, item.state)?;
         let open = open_point_count(tx, item_id)?;
         let next = match item.state {
             ItemState::Planning => ItemState::Inbox,
@@ -505,9 +554,8 @@ pub fn release_item(conn: &mut Connection, item_id: &str, cause: ReleaseCause) -
                 ))
             }
         };
-        let now = now_rfc3339();
-        clear_item_claim(tx, item_id, next, &now)?;
-        let (actor, kind) = cause_actor(cause);
+        let now = sql_now(tx)?;
+        clear_item_claim(tx, item_id, next, &now, Some(held.token.as_str()))?;
         event(
             tx,
             &now,
@@ -523,12 +571,16 @@ pub fn release_item(conn: &mut Connection, item_id: &str, cause: ReleaseCause) -
     })
 }
 
-pub fn release_job(conn: &mut Connection, job_id: &str, cause: ReleaseCause) -> Result<()> {
+pub fn release_job(conn: &mut Connection, job_id: &str, release: Release) -> Result<()> {
     with_tx(conn, |tx| {
         let job = load_job(tx, job_id)?;
-        if job.claim_token.is_none() {
-            return Err(conflict(job.state, "job is not claimed"));
-        }
+        let held = held_lease(
+            job.claim_token.as_deref(),
+            job.claim_external,
+            job.claim_pid,
+        )
+        .ok_or_else(|| conflict(job.state, "job is not claimed"))?;
+        let (actor, kind) = authorize_release(&held, &release, job.state)?;
         let next = match job.state {
             JobState::Implementing => JobState::Queued,
             JobState::InReview => JobState::ReadyForReview,
@@ -539,9 +591,8 @@ pub fn release_job(conn: &mut Connection, job_id: &str, cause: ReleaseCause) -> 
                 ))
             }
         };
-        let now = now_rfc3339();
-        clear_job_claim(tx, job_id, next, &now)?;
-        let (actor, kind) = cause_actor(cause);
+        let now = sql_now(tx)?;
+        clear_job_claim(tx, job_id, next, &now, Some(held.token.as_str()))?;
         event(
             tx,
             &now,
@@ -553,6 +604,100 @@ pub fn release_job(conn: &mut Connection, job_id: &str, cause: ReleaseCause) -> 
             Some(next.as_str()),
             None,
         )?;
+        Ok(())
+    })
+}
+
+/// Fills pid, pgid, and starttime on the unsupervised non-external row.
+/// Does not rotate the token or slide `lease_until`.
+pub fn attach_process(
+    conn: &mut Connection,
+    id: &str,
+    claim_token: &str,
+    pid: i64,
+    pgid: i64,
+    starttime: &str,
+) -> Result<()> {
+    if pid <= 0 || pgid <= 0 || pid != pgid || starttime.is_empty() {
+        return Err(Error::Invalid(
+            "pid and pgid must be equal and positive, with starttime".into(),
+        ));
+    }
+    with_tx(conn, |tx| {
+        let item_rows = tx.execute(
+            "UPDATE items SET claim_pid = ?1, claim_pgid = ?2, claim_starttime = ?3
+             WHERE id = ?4 AND claim_token = ?5 AND claim_external = 0 AND claim_pid IS NULL",
+            params![pid, pgid, starttime, id, claim_token],
+        )?;
+        let job_rows = tx.execute(
+            "UPDATE jobs SET claim_pid = ?1, claim_pgid = ?2, claim_starttime = ?3
+             WHERE id = ?4 AND claim_token = ?5 AND claim_external = 0 AND claim_pid IS NULL",
+            params![pid, pgid, starttime, id, claim_token],
+        )?;
+        if item_rows + job_rows == 1 {
+            return Ok(());
+        }
+        if item_rows + job_rows > 1 {
+            return Err(conflict(id, "id matches both an item and a job"));
+        }
+        match load_item(tx, id) {
+            Ok(item) => {
+                return Err(attach_miss(
+                    item.state,
+                    item.claim_token.as_deref(),
+                    item.claim_external,
+                    item.claim_pid,
+                    claim_token,
+                ));
+            }
+            Err(Error::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+        match load_job(tx, id) {
+            Ok(job) => {
+                return Err(attach_miss(
+                    job.state,
+                    job.claim_token.as_deref(),
+                    job.claim_external,
+                    job.claim_pid,
+                    claim_token,
+                ));
+            }
+            Err(Error::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+        Err(Error::NotFound(id.to_string()))
+    })
+}
+
+pub fn heartbeat_item(conn: &mut Connection, item_id: &str, claim_token: &str) -> Result<()> {
+    with_tx(conn, |tx| {
+        let updated = tx.execute(
+            "UPDATE items
+             SET lease_until = strftime('%Y-%m-%dT%H:%M:%SZ','now','+900 seconds')
+             WHERE id = ?1 AND claim_token = ?2",
+            params![item_id, claim_token],
+        )?;
+        if updated != 1 {
+            let item = load_item(tx, item_id)?;
+            return Err(conflict(item.state, "stale or missing claim_token"));
+        }
+        Ok(())
+    })
+}
+
+pub fn heartbeat_job(conn: &mut Connection, job_id: &str, claim_token: &str) -> Result<()> {
+    with_tx(conn, |tx| {
+        let updated = tx.execute(
+            "UPDATE jobs
+             SET lease_until = strftime('%Y-%m-%dT%H:%M:%SZ','now','+900 seconds')
+             WHERE id = ?1 AND claim_token = ?2",
+            params![job_id, claim_token],
+        )?;
+        if updated != 1 {
+            let job = load_job(tx, job_id)?;
+            return Err(conflict(job.state, "stale or missing claim_token"));
+        }
         Ok(())
     })
 }
@@ -612,29 +757,34 @@ fn submit_item_document(
         }
         match_token(item.claim_token.as_deref(), claim_token, item.state)?;
         check_detached(tree, item.state)?;
-        let plan = validate_plan_json_in(document, item.state)?;
-        let now = now_rfc3339();
+        let plan = validate_plan_json(document).map_err(|err| subjobs_conflict(item.state, err))?;
+        let now = sql_now(tx)?;
         resolve_points(tx, item_id, &plan.resolved_point_ids, &now)?;
-        // A revision returns to plan review even when every point was resolved.
         let next = ItemState::AwaitingPlanReview;
-        tx.execute(
+        let sql = format!(
             "UPDATE items SET
                 state = ?1,
                 plan_rev = plan_rev + 1,
                 summary = ?2,
                 plan_json = ?3,
                 updated_at = ?4,
-                claim_worker = NULL,
-                claim_token = NULL,
-                claim_role = NULL,
-                claim_external = 0,
-                claim_pid = NULL,
-                claim_pgid = NULL,
-                claim_starttime = NULL,
-                lease_until = NULL
-             WHERE id = ?5",
-            params![next.as_str(), plan.summary, document, now, item_id],
+                {CLEAR_CLAIM_COLS}
+             WHERE id = ?5 AND claim_token = ?6"
+        );
+        let updated = tx.execute(
+            &sql,
+            params![
+                next.as_str(),
+                plan.summary,
+                document,
+                now,
+                item_id,
+                claim_token
+            ],
         )?;
+        if updated != 1 {
+            return Err(conflict(item.state, "stale or missing claim_token"));
+        }
         event(
             tx,
             &now,
@@ -662,7 +812,7 @@ pub fn note(conn: &mut Connection, item_id: &str, text: &str) -> Result<String> 
         if matches!(item.state, ItemState::Merged | ItemState::Dropped) {
             return Err(conflict(item.state, "cannot note a terminal item"));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         let id = new_id("p")?;
         tx.execute(
             "INSERT INTO open_points (id, item_id, text, status, created_at)
@@ -697,9 +847,6 @@ pub fn note(conn: &mut Connection, item_id: &str, text: &str) -> Result<String> 
     })
 }
 
-/// Waiving a point that is not the last open one does not change item state.
-/// The last open point returns `revision_requested` to `awaiting_plan_review`
-/// only when no revise claim is held. During `revising` the row stays put.
 pub fn waive(conn: &mut Connection, item_id: &str, point_id: &str) -> Result<()> {
     with_tx(conn, |tx| {
         let item = load_item(tx, item_id)?;
@@ -718,7 +865,7 @@ pub fn waive(conn: &mut Connection, item_id: &str, point_id: &str) -> Result<()>
             Some(_) => return Err(conflict(item.state, "point is not open")),
             None => return Err(Error::NotFound(point_id.to_string())),
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         tx.execute(
             "UPDATE open_points SET status = 'waived', resolved_at = ?1 WHERE id = ?2",
             params![now, point_id],
@@ -781,7 +928,8 @@ pub fn approve(conn: &mut Connection, item_id: &str, base_sha: &str) -> Result<V
         let Some(plan_json) = item.plan_json.as_deref() else {
             return Err(conflict(item.state, "plan_json is missing"));
         };
-        let plan = validate_plan_json_in(plan_json, item.state)?;
+        let plan =
+            validate_plan_json(plan_json).map_err(|err| subjobs_conflict(item.state, err))?;
         let leaves: Vec<PlanJob> = if plan.jobs.is_empty() {
             vec![PlanJob {
                 title: item.title.clone(),
@@ -790,7 +938,7 @@ pub fn approve(conn: &mut Connection, item_id: &str, base_sha: &str) -> Result<V
         } else {
             plan.jobs
         };
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         let mut ids = Vec::with_capacity(leaves.len());
         for (ord, leaf) in leaves.iter().enumerate() {
             let job_id = new_id("j")?;
@@ -862,25 +1010,23 @@ pub fn submit_implement(
         if tree.head_is_base {
             return Err(conflict(job.state, "HEAD equals base_sha"));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         let next = JobState::ReadyForReview;
-        tx.execute(
+        let sql = format!(
             "UPDATE jobs SET
                 state = ?1,
                 diff_ref = ?2,
                 updated_at = ?3,
-                blocked_reason = NULL,
-                claim_worker = NULL,
-                claim_token = NULL,
-                claim_role = NULL,
-                claim_external = 0,
-                claim_pid = NULL,
-                claim_pgid = NULL,
-                claim_starttime = NULL,
-                lease_until = NULL
-             WHERE id = ?4",
-            params![next.as_str(), diff_ref, now, job_id],
+                {CLEAR_JOB_LEASE_COLS}
+             WHERE id = ?4 AND claim_token = ?5"
+        );
+        let updated = tx.execute(
+            &sql,
+            params![next.as_str(), diff_ref, now, job_id, claim_token],
         )?;
+        if updated != 1 {
+            return Err(conflict(job.state, "stale or missing claim_token"));
+        }
         event(
             tx,
             &now,
@@ -896,8 +1042,6 @@ pub fn submit_implement(
     })
 }
 
-/// Adapter non-zero exit. A dirty tree stays `implementing` with the claim
-/// cleared and `blocked_reason=dirty`, so the next claim is refused until retry.
 pub fn fail_implement(
     conn: &mut Connection,
     job_id: &str,
@@ -910,23 +1054,20 @@ pub fn fail_implement(
             return Err(conflict(job.state, "failure requires implementing"));
         }
         match_token(job.claim_token.as_deref(), claim_token, job.state)?;
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         if dirty {
-            tx.execute(
+            let sql = format!(
                 "UPDATE jobs SET
                     updated_at = ?1,
                     blocked_reason = 'dirty',
-                    claim_worker = NULL,
-                    claim_token = NULL,
-                    claim_role = NULL,
-                    claim_external = 0,
-                    claim_pid = NULL,
-                    claim_pgid = NULL,
-                    claim_starttime = NULL,
-                    lease_until = NULL
-                 WHERE id = ?2",
-                params![now, job_id],
-            )?;
+                    pending_permit = NULL,
+                    {CLEAR_CLAIM_COLS}
+                 WHERE id = ?2 AND claim_token = ?3"
+            );
+            let updated = tx.execute(&sql, params![now, job_id, claim_token])?;
+            if updated != 1 {
+                return Err(conflict(job.state, "stale or missing claim_token"));
+            }
             event(
                 tx,
                 &now,
@@ -939,7 +1080,7 @@ pub fn fail_implement(
                 Some("dirty"),
             )?;
         } else {
-            clear_job_claim(tx, job_id, JobState::Queued, &now)?;
+            clear_job_claim(tx, job_id, JobState::Queued, &now, Some(claim_token))?;
             event(
                 tx,
                 &now,
@@ -968,8 +1109,8 @@ pub fn retry_job(conn: &mut Connection, job_id: &str) -> Result<()> {
                 "retry requires implementing, unclaimed, blocked_reason=dirty",
             ));
         }
-        let now = now_rfc3339();
-        clear_job_claim(tx, job_id, JobState::Queued, &now)?;
+        let now = sql_now(tx)?;
+        clear_job_claim(tx, job_id, JobState::Queued, &now, None)?;
         event(
             tx,
             &now,
@@ -995,11 +1136,9 @@ pub fn submit_review(
     if review_json.len() > DOC_MAX {
         return Err(Error::Invalid("document exceeds 256 KiB".into()));
     }
-    if serde_json::from_str::<serde_json::Value>(review_json)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .is_none()
-    {
+    let review_value: serde_json::Value = serde_json::from_str(review_json)
+        .map_err(|err| Error::Invalid(format!("review is not JSON: {err}")))?;
+    if review_value.as_object().is_none() {
         return Err(Error::Invalid(
             "review document must be a JSON object".into(),
         ));
@@ -1011,25 +1150,24 @@ pub fn submit_review(
         }
         match_token(job.claim_token.as_deref(), claim_token, job.state)?;
         check_detached(tree, job.state)?;
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         let next = JobState::FeedbackPending;
-        tx.execute(
+        let sql = format!(
             "UPDATE jobs SET
                 state = ?1,
                 review_rev = review_rev + 1,
                 review_json = ?2,
                 updated_at = ?3,
-                claim_worker = NULL,
-                claim_token = NULL,
-                claim_role = NULL,
-                claim_external = 0,
-                claim_pid = NULL,
-                claim_pgid = NULL,
-                claim_starttime = NULL,
-                lease_until = NULL
-             WHERE id = ?4",
-            params![next.as_str(), review_json, now, job_id],
+                {CLEAR_JOB_LEASE_COLS}
+             WHERE id = ?4 AND claim_token = ?5"
+        );
+        let updated = tx.execute(
+            &sql,
+            params![next.as_str(), review_json, now, job_id, claim_token],
         )?;
+        if updated != 1 {
+            return Err(conflict(job.state, "stale or missing claim_token"));
+        }
         event(
             tx,
             &now,
@@ -1051,7 +1189,7 @@ pub fn accept_job(conn: &mut Connection, job_id: &str) -> Result<()> {
         if job.state != JobState::FeedbackPending {
             return Err(conflict(job.state, "accept requires feedback_pending"));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         set_job_state(tx, job_id, JobState::Accepted, &now)?;
         event(
             tx,
@@ -1080,7 +1218,7 @@ pub fn reject_job(conn: &mut Connection, job_id: &str, text: &str) -> Result<()>
         if job.state != JobState::FeedbackPending {
             return Err(conflict(job.state, "reject requires feedback_pending"));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         let note_id = new_id("n")?;
         tx.execute(
             "INSERT INTO job_notes (id, job_id, text, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -1109,35 +1247,23 @@ pub fn drop_item(conn: &mut Connection, item_id: &str, force: bool) -> Result<()
             return Err(conflict(item.state, "terminal items cannot be dropped"));
         }
         let jobs = job_flags(tx, item_id)?;
-        let claimed = item.claim_token.is_some()
+        let needs_force = item.claim_token.is_some()
             || jobs.iter().any(|job| {
                 job.claimed || matches!(job.state, JobState::Implementing | JobState::InReview)
-            });
-        let state_needs_force = matches!(
-            item.state,
-            ItemState::Planning | ItemState::Revising | ItemState::Implementing
-        );
-        if (claimed || state_needs_force) && !force {
+            })
+            || matches!(
+                item.state,
+                ItemState::Planning | ItemState::Revising | ItemState::Implementing
+            );
+        if needs_force && !force {
             return Err(conflict(item.state, "drop requires --force"));
         }
-        let plain = matches!(
-            item.state,
-            ItemState::Inbox
-                | ItemState::AwaitingPlanReview
-                | ItemState::RevisionRequested
-                | ItemState::AwaitingImplementation
-                | ItemState::AwaitingMerge
-                | ItemState::MergeConflict
-        );
-        if !plain && !force {
-            return Err(conflict(item.state, "drop requires --force"));
-        }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         for job in &jobs {
             if job.state == JobState::Cancelled {
                 continue;
             }
-            clear_job_claim(tx, &job.id, JobState::Cancelled, &now)?;
+            clear_job_claim(tx, &job.id, JobState::Cancelled, &now, None)?;
             event(
                 tx,
                 &now,
@@ -1150,7 +1276,7 @@ pub fn drop_item(conn: &mut Connection, item_id: &str, force: bool) -> Result<()
                 None,
             )?;
         }
-        clear_item_claim(tx, item_id, ItemState::Dropped, &now)?;
+        clear_item_claim(tx, item_id, ItemState::Dropped, &now, None)?;
         event(
             tx,
             &now,
@@ -1166,7 +1292,6 @@ pub fn drop_item(conn: &mut Connection, item_id: &str, force: bool) -> Result<()
     })
 }
 
-/// Records a successful local merge. Git stays in the caller.
 pub fn merge_item(conn: &mut Connection, item_id: &str, merged_sha: &str) -> Result<()> {
     if merged_sha.is_empty() {
         return Err(Error::Invalid("merged_sha is empty".into()));
@@ -1176,7 +1301,7 @@ pub fn merge_item(conn: &mut Connection, item_id: &str, merged_sha: &str) -> Res
         if item.state != ItemState::AwaitingMerge {
             return Err(conflict(item.state, "merge requires awaiting_merge"));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         tx.execute(
             "UPDATE items SET
                 state = 'merged',
@@ -1201,7 +1326,6 @@ pub fn merge_item(conn: &mut Connection, item_id: &str, merged_sha: &str) -> Res
     })
 }
 
-/// Moves `awaiting_merge` to `merge_conflict`. Does not change integrate sha or ord.
 pub fn mark_merge_conflict(conn: &mut Connection, item_id: &str, kind: ConflictKind) -> Result<()> {
     with_tx(conn, |tx| {
         let item = load_item(tx, item_id)?;
@@ -1211,7 +1335,7 @@ pub fn mark_merge_conflict(conn: &mut Connection, item_id: &str, kind: ConflictK
                 "merge conflict requires awaiting_merge",
             ));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         tx.execute(
             "UPDATE items SET state = 'merge_conflict', conflict_kind = ?1, updated_at = ?2
              WHERE id = ?3",
@@ -1244,7 +1368,7 @@ pub fn merge_continue(conn: &mut Connection, item_id: &str, merged_sha: &str) ->
                 "merge --continue requires merge_conflict",
             ));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         tx.execute(
             "UPDATE items SET
                 state = 'merged',
@@ -1269,7 +1393,6 @@ pub fn merge_continue(conn: &mut Connection, item_id: &str, merged_sha: &str) ->
     })
 }
 
-/// Throws the integrate result away. Does not touch the primary or leaf branches.
 pub fn merge_abort(conn: &mut Connection, item_id: &str) -> Result<()> {
     with_tx(conn, |tx| {
         let item = load_item(tx, item_id)?;
@@ -1279,7 +1402,7 @@ pub fn merge_abort(conn: &mut Connection, item_id: &str) -> Result<()> {
                 "merge --abort requires merge_conflict",
             ));
         }
-        let now = now_rfc3339();
+        let now = sql_now(tx)?;
         tx.execute(
             "UPDATE items SET
                 state = 'awaiting_merge',
@@ -1305,13 +1428,7 @@ pub fn merge_abort(conn: &mut Connection, item_id: &str) -> Result<()> {
     })
 }
 
-/// Rejects a document whose jobs contain a non-empty `subjobs` array.
-/// Depth-2 is a later change; until then any nested job is a conflict.
 pub fn validate_plan_json(document: &str) -> Result<PlanDocument> {
-    validate_plan_json_in(document, ItemState::AwaitingPlanReview)
-}
-
-fn validate_plan_json_in(document: &str, state: ItemState) -> Result<PlanDocument> {
     if document.len() > DOC_MAX {
         return Err(Error::Invalid("document exceeds 256 KiB".into()));
     }
@@ -1334,7 +1451,16 @@ fn validate_plan_json_in(document: &str, state: ItemState) -> Result<PlanDocumen
                 let job = entry
                     .as_object()
                     .ok_or_else(|| Error::Invalid("job must be an object".into()))?;
-                reject_subjobs(job.get("subjobs"), state)?;
+                match job.get("subjobs") {
+                    None => {}
+                    Some(serde_json::Value::Array(nested)) if nested.is_empty() => {}
+                    Some(serde_json::Value::Array(_)) => {
+                        return Err(Error::Invalid(
+                            "plan jobs contain a non-empty subjobs array".into(),
+                        ));
+                    }
+                    Some(_) => return Err(Error::Invalid("subjobs must be an array".into())),
+                }
                 let title = job
                     .get("title")
                     .and_then(serde_json::Value::as_str)
@@ -1357,7 +1483,6 @@ fn validate_plan_json_in(document: &str, state: ItemState) -> Result<PlanDocumen
         Some(_) => return Err(Error::Invalid("jobs must be an array".into())),
     };
     let mut resolved_point_ids = Vec::new();
-    let mut seen = Vec::new();
     if let Some(ids) = object.get("resolved_point_ids") {
         let list = ids
             .as_array()
@@ -1366,10 +1491,9 @@ fn validate_plan_json_in(document: &str, state: ItemState) -> Result<PlanDocumen
             let id = id
                 .as_str()
                 .ok_or_else(|| Error::Invalid("resolved point id must be a string".into()))?;
-            if seen.iter().any(|existing: &String| existing == id) {
+            if resolved_point_ids.iter().any(|existing| existing == id) {
                 return Err(Error::Invalid(format!("duplicate resolved point {id}")));
             }
-            seen.push(id.to_string());
             resolved_point_ids.push(id.to_string());
         }
     }
@@ -1380,15 +1504,12 @@ fn validate_plan_json_in(document: &str, state: ItemState) -> Result<PlanDocumen
     })
 }
 
-fn reject_subjobs(subjobs: Option<&serde_json::Value>, state: ItemState) -> Result<()> {
-    match subjobs {
-        None => Ok(()),
-        Some(serde_json::Value::Array(entries)) if entries.is_empty() => Ok(()),
-        Some(serde_json::Value::Array(_)) => Err(conflict(
-            state,
-            "plan jobs contain a non-empty subjobs array",
-        )),
-        Some(_) => Err(Error::Invalid("subjobs must be an array".into())),
+fn subjobs_conflict(state: impl AsState, err: Error) -> Error {
+    match err {
+        Error::Invalid(message) if message.contains("non-empty subjobs") => {
+            conflict(state, message)
+        }
+        other => other,
     }
 }
 
@@ -1463,7 +1584,7 @@ fn promote_containers(tx: &Transaction, job_id: &str, now: &str) -> Result<()> {
         if parent_job.state != JobState::Queued {
             return Ok(());
         }
-        clear_job_claim(tx, &parent, JobState::Accepted, now)?;
+        clear_job_claim(tx, &parent, JobState::Accepted, now, None)?;
         event(
             tx,
             now,
@@ -1521,14 +1642,14 @@ fn ensure_can_claim(
 ) -> Result<()> {
     if existing_token.is_some() {
         // Includes the pre-spawn window where claim_pid is still null.
-        return Err(conflict_str(state, "claim still held"));
+        return Err(conflict(state, "claim still held"));
     }
     if blocked_reason == Some("dirty") {
-        return Err(conflict_str(state, "blocked_reason=dirty; retry first"));
+        return Err(conflict(state, "blocked_reason=dirty; retry first"));
     }
     let leases = lease_count(tx)?;
     if leases >= MAX_LEASES {
-        return Err(conflict_str(state, "lease cap is 4"));
+        return Err(conflict(state, "lease cap is 4"));
     }
     Ok(())
 }
@@ -1558,22 +1679,13 @@ fn write_item_claim(
     item_id: &str,
     spec: &ClaimSpec,
     next: ItemState,
+    now: &str,
 ) -> Result<Claim> {
-    let now = now_rfc3339();
-    let claim = insert_claim_fields(spec)?;
+    let claim = insert_claim_fields(tx, spec)?;
+    let sql =
+        format!("UPDATE items SET state = ?1, updated_at = ?2, {SET_CLAIM_COLS} WHERE id = ?11");
     tx.execute(
-        "UPDATE items SET
-            state = ?1,
-            updated_at = ?2,
-            claim_worker = ?3,
-            claim_token = ?4,
-            claim_role = ?5,
-            claim_external = ?6,
-            claim_pid = ?7,
-            claim_pgid = ?8,
-            claim_starttime = ?9,
-            lease_until = ?10
-         WHERE id = ?11",
+        &sql,
         params![
             next.as_str(),
             now,
@@ -1591,19 +1703,44 @@ fn write_item_claim(
     Ok(claim)
 }
 
-fn insert_claim_fields(spec: &ClaimSpec) -> Result<Claim> {
-    if spec.worker_id.is_empty() {
-        return Err(Error::Invalid("worker_id is empty".into()));
-    }
-    if spec.external && spec.pid.is_none() {
-        return Err(Error::Invalid("external claim requires a pid".into()));
-    }
+fn insert_claim_fields(tx: &Transaction, spec: &ClaimSpec) -> Result<Claim> {
+    check_claim_spec(spec)?;
     Ok(Claim {
         token: new_token()?,
         worker_id: spec.worker_id.clone(),
         role: spec.role,
-        lease_until: rfc3339_from_unix(unix_now().saturating_add(LEASE_SECS)),
+        lease_until: sql_lease_until(tx)?,
     })
+}
+
+fn check_claim_spec(spec: &ClaimSpec) -> Result<()> {
+    if spec.worker_id.is_empty() {
+        return Err(Error::Invalid("worker_id is empty".into()));
+    }
+    if spec.external {
+        if spec.pid.is_none_or(|pid| pid <= 0) {
+            return Err(Error::Invalid(
+                "external claim requires a positive pid".into(),
+            ));
+        }
+        if spec.starttime.as_deref().unwrap_or("").is_empty() {
+            return Err(Error::Invalid("external claim requires starttime".into()));
+        }
+        return Ok(());
+    }
+    let start_empty = spec.starttime.as_deref().unwrap_or("").is_empty();
+    let unsupervised = spec.pid.is_none() && spec.pgid.is_none() && start_empty;
+    let attached = matches!(
+        (spec.pid, spec.pgid),
+        (Some(pid), Some(pgid)) if pid > 0 && pid == pgid
+    ) && !start_empty;
+    if unsupervised || attached {
+        return Ok(());
+    }
+    Err(Error::Invalid(
+        "spawned claim must leave pid, pgid, and starttime unset, or set pid = pgid > 0 with starttime"
+            .into(),
+    ))
 }
 
 fn match_token(held: Option<&str>, given: &str, state: impl AsState) -> Result<()> {
@@ -1623,49 +1760,133 @@ fn check_detached(tree: DetachedWorktree, state: impl AsState) -> Result<()> {
     Ok(())
 }
 
-fn cause_actor(cause: ReleaseCause) -> (&'static str, &'static str) {
-    match cause {
-        ReleaseCause::Human => (HUMAN, "release"),
-        ReleaseCause::Expiry => (REAPER, "expire"),
+struct HeldLease {
+    token: String,
+    external: bool,
+    pid: Option<i64>,
+}
+
+fn held_lease(token: Option<&str>, external: bool, pid: Option<i64>) -> Option<HeldLease> {
+    token.map(|token| HeldLease {
+        token: token.to_string(),
+        external,
+        pid,
+    })
+}
+
+fn authorize_release(
+    held: &HeldLease,
+    release: &Release,
+    state: impl AsState,
+) -> Result<(&'static str, &'static str)> {
+    if let Some(token) = &release.claim_token {
+        if token != &held.token {
+            return Err(conflict(state, "stale or missing claim_token"));
+        }
+    }
+    match release.cause {
+        ReleaseCause::Expiry => {
+            if release.force {
+                return Err(Error::Invalid("expiry has no --force".into()));
+            }
+            // A null pid is the pre-spawn window. Only a human release clears it.
+            if held.pid.is_none() {
+                return Err(conflict(state, "null claim_pid is not expired"));
+            }
+            if !release.pid_gone {
+                return Err(conflict(state, "lease pid is still live"));
+            }
+            Ok((REAPER, "expire"))
+        }
+        ReleaseCause::Human if release.claim_token.is_some() => {
+            if release.force {
+                return Err(Error::Invalid("MCP release has no --force".into()));
+            }
+            if held.pid.is_some() && !release.pid_gone {
+                return Err(conflict(state, "lease pid is still live"));
+            }
+            Ok(("mcp", "release"))
+        }
+        ReleaseCause::Human => {
+            if held.external && !release.pid_gone && !release.force {
+                return Err(conflict(
+                    state,
+                    "external pid still matches; release needs --force",
+                ));
+            }
+            Ok((HUMAN, "release"))
+        }
     }
 }
 
-fn clear_item_claim(tx: &Transaction, item_id: &str, state: ItemState, now: &str) -> Result<()> {
-    tx.execute(
-        "UPDATE items SET
-            state = ?1,
-            updated_at = ?2,
-            claim_worker = NULL,
-            claim_token = NULL,
-            claim_role = NULL,
-            claim_external = 0,
-            claim_pid = NULL,
-            claim_pgid = NULL,
-            claim_starttime = NULL,
-            lease_until = NULL
-         WHERE id = ?3",
-        params![state.as_str(), now, item_id],
-    )?;
+fn attach_miss(
+    state: impl AsState,
+    token: Option<&str>,
+    external: bool,
+    pid: Option<i64>,
+    claim_token: &str,
+) -> Error {
+    if token != Some(claim_token) {
+        return conflict(state, "stale or missing claim_token");
+    }
+    if external {
+        return conflict(state, "external lease is not attached");
+    }
+    if pid.is_some() {
+        return conflict(state, "claim_pid is already set");
+    }
+    conflict(state, "claim is not the unsupervised window")
+}
+
+fn clear_item_claim(
+    tx: &Transaction,
+    item_id: &str,
+    state: ItemState,
+    now: &str,
+    token: Option<&str>,
+) -> Result<()> {
+    let sql = if token.is_some() {
+        format!(
+            "UPDATE items SET state = ?1, updated_at = ?2, {CLEAR_CLAIM_COLS}
+             WHERE id = ?3 AND claim_token = ?4"
+        )
+    } else {
+        format!("UPDATE items SET state = ?1, updated_at = ?2, {CLEAR_CLAIM_COLS} WHERE id = ?3")
+    };
+    let updated = if let Some(token) = token {
+        tx.execute(&sql, params![state.as_str(), now, item_id, token])?
+    } else {
+        tx.execute(&sql, params![state.as_str(), now, item_id])?
+    };
+    if updated != 1 {
+        return Err(conflict(state, "stale or missing claim_token"));
+    }
     Ok(())
 }
 
-fn clear_job_claim(tx: &Transaction, job_id: &str, state: JobState, now: &str) -> Result<()> {
-    tx.execute(
-        "UPDATE jobs SET
-            state = ?1,
-            updated_at = ?2,
-            blocked_reason = NULL,
-            claim_worker = NULL,
-            claim_token = NULL,
-            claim_role = NULL,
-            claim_external = 0,
-            claim_pid = NULL,
-            claim_pgid = NULL,
-            claim_starttime = NULL,
-            lease_until = NULL
-         WHERE id = ?3",
-        params![state.as_str(), now, job_id],
-    )?;
+fn clear_job_claim(
+    tx: &Transaction,
+    job_id: &str,
+    state: JobState,
+    now: &str,
+    token: Option<&str>,
+) -> Result<()> {
+    let sql = if token.is_some() {
+        format!(
+            "UPDATE jobs SET state = ?1, updated_at = ?2, {CLEAR_JOB_LEASE_COLS}
+             WHERE id = ?3 AND claim_token = ?4"
+        )
+    } else {
+        format!("UPDATE jobs SET state = ?1, updated_at = ?2, {CLEAR_JOB_LEASE_COLS} WHERE id = ?3")
+    };
+    let updated = if let Some(token) = token {
+        tx.execute(&sql, params![state.as_str(), now, job_id, token])?
+    } else {
+        tx.execute(&sql, params![state.as_str(), now, job_id])?
+    };
+    if updated != 1 {
+        return Err(conflict(state, "stale or missing claim_token"));
+    }
     Ok(())
 }
 
@@ -1708,7 +1929,8 @@ fn find_external(tx: &Transaction, source: &str, external_id: &str) -> Result<Op
 fn load_item(tx: &Transaction, item_id: &str) -> Result<Item> {
     let row = tx
         .query_row(
-            "SELECT title, state, repo, target_branch, plan_json, claim_token
+            "SELECT title, state, repo, target_branch, plan_json, claim_token,
+                    claim_external, claim_pid
              FROM items WHERE id = ?1",
             params![item_id],
             |row| {
@@ -1719,11 +1941,23 @@ fn load_item(tx: &Transaction, item_id: &str) -> Result<Item> {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((title, state, repo, target_branch, plan_json, claim_token)) = row else {
+    let Some((
+        title,
+        state,
+        repo,
+        target_branch,
+        plan_json,
+        claim_token,
+        claim_external,
+        claim_pid,
+    )) = row
+    else {
         return Err(Error::NotFound(item_id.to_string()));
     };
     Ok(Item {
@@ -1733,13 +1967,16 @@ fn load_item(tx: &Transaction, item_id: &str) -> Result<Item> {
         target_branch,
         plan_json,
         claim_token,
+        claim_external: claim_external != 0,
+        claim_pid,
     })
 }
 
 fn load_job(tx: &Transaction, job_id: &str) -> Result<Job> {
     let row = tx
         .query_row(
-            "SELECT item_id, state, claim_token, implementer_worker, blocked_reason
+            "SELECT item_id, state, claim_token, claim_external, claim_pid,
+                    implementer_worker, blocked_reason
              FROM jobs WHERE id = ?1",
             params![job_id],
             |row| {
@@ -1747,19 +1984,32 @@ fn load_job(tx: &Transaction, job_id: &str) -> Result<Job> {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((item_id, state, claim_token, implementer_worker, blocked_reason)) = row else {
+    let Some((
+        item_id,
+        state,
+        claim_token,
+        claim_external,
+        claim_pid,
+        implementer_worker,
+        blocked_reason,
+    )) = row
+    else {
         return Err(Error::NotFound(job_id.to_string()));
     };
     Ok(Job {
         item_id,
         state: JobState::parse(&state)?,
         claim_token,
+        claim_external: claim_external != 0,
+        claim_pid,
         implementer_worker,
         blocked_reason,
     })
@@ -1824,11 +2074,20 @@ fn conflict(state: impl AsState, message: impl Into<String>) -> Error {
     }
 }
 
-fn conflict_str(state: &str, message: impl Into<String>) -> Error {
-    Error::Conflict {
-        state: state.to_string(),
-        message: message.into(),
-    }
+fn sql_now(tx: &Transaction) -> Result<String> {
+    let now = tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |row| {
+        row.get(0)
+    })?;
+    Ok(now)
+}
+
+fn sql_lease_until(tx: &Transaction) -> Result<String> {
+    let until = tx.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now','+900 seconds')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(until)
 }
 
 fn normalize_title(raw: &str) -> Result<String> {
@@ -1879,44 +2138,6 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0xf) as usize] as char);
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn now_rfc3339() -> String {
-    rfc3339_from_unix(unix_now())
-}
-
-fn rfc3339_from_unix(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let tod = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = tod / 3600;
-    let minute = (tod % 3600) / 60;
-    let second = tod % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Days since 1970-01-01 to a civil date. Howard Hinnant, public domain.
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let mut year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    if month <= 2 {
-        year += 1;
-    }
-    (year as i32, month, day)
 }
 
 #[cfg(test)]
@@ -2132,15 +2353,19 @@ mod tests {
         assert_eq!(state, "planning");
         assert!(message.contains("claim"), "{message}");
 
-        release_item(&mut conn, &id, ReleaseCause::Human).unwrap();
+        release_item(&mut conn, &id, Release::human()).unwrap();
         assert_eq!(item_state(&mut conn, &id), "inbox");
         assert!(claim_token_item(&mut conn, &id).is_none());
 
         let claim = claim_item(&mut conn, &id, ClaimSpec::daemon("grok:plan", Role::Plan)).unwrap();
         assert!(!claim.token.is_empty());
-        release_item(&mut conn, &id, ReleaseCause::Expiry).unwrap();
+        let (state, message) = conflict_of(release_item(&mut conn, &id, Release::expiry(true)));
+        assert_eq!(state, "planning");
+        assert!(message.contains("null claim_pid"), "{message}");
+        assert_eq!(item_state(&mut conn, &id), "planning");
+        release_item(&mut conn, &id, Release::human()).unwrap();
         assert_eq!(item_state(&mut conn, &id), "inbox");
-        let (state, _) = conflict_of(release_item(&mut conn, &id, ReleaseCause::Human));
+        let (state, _) = conflict_of(release_item(&mut conn, &id, Release::human()));
         assert_eq!(state, "inbox");
     }
 
@@ -2226,7 +2451,7 @@ mod tests {
             r#"{"jobs":[{"title":"a","subjobs":[{"title":"b","subjobs":[{"title":"c"}]}]}]}"#,
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Conflict { .. }));
+        assert!(matches!(err, Error::Invalid(_)));
         let doc = validate_plan_json(r#"{"summary":"s","jobs":[]}"#).unwrap();
         assert!(doc.jobs.is_empty());
         assert_eq!(doc.summary, "s");
@@ -2303,30 +2528,35 @@ mod tests {
         let claim =
             claim_item(&mut conn, &id, ClaimSpec::daemon("grok:rev", Role::Revise)).unwrap();
         assert!(!claim.token.is_empty());
-        release_item(&mut conn, &id, ReleaseCause::Human).unwrap();
+        release_item(&mut conn, &id, Release::human()).unwrap();
         assert_eq!(item_state(&mut conn, &id), "revision_requested");
         assert_eq!(point_status(&mut conn, &point), "open");
         assert!(claim_token_item(&mut conn, &id).is_none());
 
         let claim =
             claim_item(&mut conn, &id, ClaimSpec::daemon("grok:rev", Role::Revise)).unwrap();
-        assert!(!claim.token.is_empty());
-        release_item(&mut conn, &id, ReleaseCause::Expiry).unwrap();
+        let (state, _) = conflict_of(release_item(&mut conn, &id, Release::expiry(false)));
+        assert_eq!(state, "revising");
+        attach_process(&mut conn, &id, &claim.token, 40, 40, "start").unwrap();
+        let (state, _) = conflict_of(release_item(&mut conn, &id, Release::expiry(false)));
+        assert_eq!(state, "revising");
+        release_item(&mut conn, &id, Release::expiry(true)).unwrap();
         assert_eq!(item_state(&mut conn, &id), "revision_requested");
 
         let claim =
             claim_item(&mut conn, &id, ClaimSpec::daemon("grok:rev", Role::Revise)).unwrap();
         waive(&mut conn, &id, &point).unwrap();
         assert_eq!(item_state(&mut conn, &id), "revising");
-        release_item(&mut conn, &id, ReleaseCause::Human).unwrap();
+        release_item(&mut conn, &id, Release::human()).unwrap();
         assert_eq!(item_state(&mut conn, &id), "awaiting_plan_review");
         let _ = claim;
 
         let point = note(&mut conn, &id, "again").unwrap();
-        let _claim =
+        let claim =
             claim_item(&mut conn, &id, ClaimSpec::daemon("grok:rev", Role::Revise)).unwrap();
         waive(&mut conn, &id, &point).unwrap();
-        release_item(&mut conn, &id, ReleaseCause::Expiry).unwrap();
+        attach_process(&mut conn, &id, &claim.token, 41, 41, "start").unwrap();
+        release_item(&mut conn, &id, Release::expiry(true)).unwrap();
         assert_eq!(item_state(&mut conn, &id), "awaiting_plan_review");
     }
 
@@ -2553,17 +2783,20 @@ mod tests {
         assert!(submit_implement(&mut conn, &job, &claim.token, "sha", same_base).is_err());
         assert_eq!(job_state(&mut conn, &job), "implementing");
 
-        release_job(&mut conn, &job, ReleaseCause::Human).unwrap();
+        release_job(&mut conn, &job, Release::human()).unwrap();
         assert_eq!(job_state(&mut conn, &job), "queued");
         assert!(claim_token_job(&mut conn, &job).is_none());
 
-        let _claim = claim_job(
+        let claim = claim_job(
             &mut conn,
             &job,
             ClaimSpec::daemon("grok:impl", Role::Implement),
         )
         .unwrap();
-        release_job(&mut conn, &job, ReleaseCause::Expiry).unwrap();
+        assert!(release_job(&mut conn, &job, Release::expiry(true)).is_err());
+        attach_process(&mut conn, &job, &claim.token, 50, 50, "start").unwrap();
+        assert!(release_job(&mut conn, &job, Release::expiry(false)).is_err());
+        release_job(&mut conn, &job, Release::expiry(true)).unwrap();
         assert_eq!(job_state(&mut conn, &job), "queued");
 
         let claim = claim_job(
@@ -2709,7 +2942,7 @@ mod tests {
         )
         .unwrap();
         assert!(!claim.token.is_empty());
-        release_job(&mut conn, &job, ReleaseCause::Human).unwrap();
+        release_job(&mut conn, &job, Release::human()).unwrap();
         assert_eq!(job_state(&mut conn, &job), "ready_for_review");
         let claim = claim_job(
             &mut conn,
@@ -2718,7 +2951,9 @@ mod tests {
         )
         .unwrap();
         assert!(!claim.token.is_empty());
-        release_job(&mut conn, &job, ReleaseCause::Expiry).unwrap();
+        assert!(release_job(&mut conn, &job, Release::expiry(false)).is_err());
+        attach_process(&mut conn, &job, &claim.token, 60, 60, "start").unwrap();
+        release_job(&mut conn, &job, Release::expiry(true)).unwrap();
         assert_eq!(job_state(&mut conn, &job), "ready_for_review");
         assert!(claim_token_job(&mut conn, &job).is_none());
     }
@@ -2849,7 +3084,7 @@ mod tests {
         );
         assert_eq!(state, "inbox");
         assert!(message.contains("cap"), "{message}");
-        release_item(&mut conn, &ids[0], ReleaseCause::Human).unwrap();
+        release_item(&mut conn, &ids[0], Release::human()).unwrap();
         claim_item(
             &mut conn,
             &extra,
@@ -2874,6 +3109,14 @@ mod tests {
         spec.external = true;
         spec.pid = Some(42);
         spec.pgid = Some(99);
+        assert!(matches!(
+            claim_item(&mut conn, &id, spec),
+            Err(Error::Invalid(_))
+        ));
+        let mut spec = ClaimSpec::daemon("mcp:1", Role::Plan);
+        spec.external = true;
+        spec.pid = Some(42);
+        spec.starttime = Some("22".into());
         let claim = claim_item(&mut conn, &id, spec).unwrap();
         assert!(!claim.token.is_empty());
         let pgid: Option<i64> = conn
@@ -2892,6 +3135,146 @@ mod tests {
             )
             .unwrap();
         assert_eq!(external, 1);
+        let (state, message) = conflict_of(release_item(&mut conn, &id, Release::human()));
+        assert_eq!(state, "planning");
+        assert!(message.contains("force"), "{message}");
+        let (state, _) = conflict_of(release_item(&mut conn, &id, Release::expiry(false)));
+        assert_eq!(state, "planning");
+        let mut mcp = Release::human();
+        mcp.claim_token = Some(claim.token.clone());
+        let (state, _) = conflict_of(release_item(&mut conn, &id, mcp));
+        assert_eq!(state, "planning");
+        let mut mcp_gone = Release::human();
+        mcp_gone.claim_token = Some("nope".into());
+        mcp_gone.pid_gone = true;
+        let (state, message) = conflict_of(release_item(&mut conn, &id, mcp_gone));
+        assert_eq!(state, "planning");
+        assert!(message.contains("token"), "{message}");
+        let mut mcp_ok = Release::human();
+        mcp_ok.claim_token = Some(claim.token.clone());
+        mcp_ok.pid_gone = true;
+        release_item(&mut conn, &id, mcp_ok).unwrap();
+        assert_eq!(item_state(&mut conn, &id), "inbox");
+
+        let id = item(&mut conn);
+        let mut spec = ClaimSpec::daemon("mcp:2", Role::Plan);
+        spec.external = true;
+        spec.pid = Some(7);
+        spec.starttime = Some("22".into());
+        claim_item(&mut conn, &id, spec).unwrap();
+        let mut forced = Release::human();
+        forced.force = true;
+        release_item(&mut conn, &id, forced).unwrap();
+        assert_eq!(item_state(&mut conn, &id), "inbox");
+    }
+
+    #[test]
+    fn attach_process_fills_the_unsupervised_window_and_heartbeat_is_per_row() {
+        let mut conn = mem();
+        let id = item(&mut conn);
+        let claim = claim_item(&mut conn, &id, ClaimSpec::daemon("grok:plan", Role::Plan)).unwrap();
+        let other = item(&mut conn);
+        assert!(matches!(
+            claim_item(
+                &mut conn,
+                &other,
+                ClaimSpec {
+                    worker_id: "grok:bad".into(),
+                    role: Role::Plan,
+                    external: false,
+                    pid: Some(3),
+                    pgid: None,
+                    starttime: None,
+                },
+            ),
+            Err(Error::Invalid(_))
+        ));
+        assert!(attach_process(&mut conn, &id, "stale", 8, 8, "t").is_err());
+        attach_process(&mut conn, &id, &claim.token, 8, 8, "t").unwrap();
+        assert!(attach_process(&mut conn, &id, &claim.token, 8, 8, "t").is_err());
+        let (pid, pgid, start): (i64, i64, String) = conn
+            .query_row(
+                "SELECT claim_pid, claim_pgid, claim_starttime FROM items WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((pid, pgid, start), (8, 8, "t".into()));
+        conn.execute(
+            "UPDATE items SET lease_until = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(heartbeat_item(&mut conn, &id, "nope").is_err());
+        heartbeat_item(&mut conn, &id, &claim.token).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT lease_until FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(after, "2000-01-01T00:00:00Z");
+
+        release_item(&mut conn, &id, Release::expiry(true)).unwrap();
+        let (item_id, job) = to_approved(&mut conn);
+        conn.execute(
+            "UPDATE jobs SET pending_permit = '{\"id\":1}' WHERE id = ?1",
+            params![job],
+        )
+        .unwrap();
+        let job_claim = claim_job(
+            &mut conn,
+            &job,
+            ClaimSpec::daemon("grok:impl", Role::Implement),
+        )
+        .unwrap();
+        let permit: Option<String> = conn
+            .query_row(
+                "SELECT pending_permit FROM jobs WHERE id = ?1",
+                params![job],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(permit.is_none());
+        conn.execute(
+            "UPDATE jobs SET pending_permit = '{\"id\":1}', lease_until = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            params![job],
+        )
+        .unwrap();
+        let item_lease: Option<String> = conn
+            .query_row(
+                "SELECT lease_until FROM items WHERE id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        heartbeat_job(&mut conn, &job, &job_claim.token).unwrap();
+        let job_lease: String = conn
+            .query_row(
+                "SELECT lease_until FROM jobs WHERE id = ?1",
+                params![job],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(job_lease, "2000-01-01T00:00:00Z");
+        let item_lease_after: Option<String> = conn
+            .query_row(
+                "SELECT lease_until FROM items WHERE id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_lease, item_lease_after);
+        fail_implement(&mut conn, &job, &job_claim.token, true).unwrap();
+        let permit: Option<String> = conn
+            .query_row(
+                "SELECT pending_permit FROM jobs WHERE id = ?1",
+                params![job],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(permit.is_none());
     }
 
     #[test]

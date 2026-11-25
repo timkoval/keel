@@ -60,8 +60,8 @@ impl From<std::io::Error> for Error {
 
 /// Open the daemon's one database file and apply pending migrations.
 ///
-/// Pragmas match the design: WAL, `synchronous=NORMAL`, `busy_timeout=2000`.
-/// Foreign keys are on so the schema's REFERENCES are enforced.
+/// `foreign_keys` is not persisted by SQLite, so every open turns it on.
+/// Otherwise the schema's REFERENCES are not enforced.
 pub fn open(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
     configure(&conn)?;
@@ -69,7 +69,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-pub fn open_in_memory() -> Result<Connection> {
+#[cfg(test)]
+pub(crate) fn open_in_memory() -> Result<Connection> {
     let mut conn = Connection::open_in_memory()?;
     configure(&conn)?;
     migrate(&mut conn)?;
