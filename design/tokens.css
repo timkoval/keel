@@ -133,4 +133,6 @@ pre.body {
   border-bottom: 1px solid var(--line);
 }
 
+.jobs li.sub { padding-left: 1.25rem; }
+
 .points .grow, .jobs .grow { flex: 1; min-width: 0; }

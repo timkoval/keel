@@ -298,12 +298,19 @@ impl ImplementWorktree {
     }
 }
 
+/// A depth-2 leaf. It has no children. A non-empty `subjobs` array here is depth 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanLeaf {
+    pub title: String,
+    pub acceptance: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanJob {
     pub title: String,
     pub acceptance: String,
     /// Empty means this job is a leaf. Non-empty means it is a container.
-    pub subjobs: Vec<PlanJob>,
+    pub subjobs: Vec<PlanLeaf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1126,9 +1133,32 @@ pub fn approve(conn: &mut Connection, item_id: &str, base_sha: &str) -> Result<V
         let mut ord = 0i64;
         let mut ids = Vec::new();
         for job in &jobs {
-            insert_plan_job(
-                tx, item_id, None, job, 1, &mut ord, base_sha, &now, &mut ids,
+            let parent = insert_queued_job(
+                tx,
+                item_id,
+                None,
+                &job.title,
+                &job.acceptance,
+                1,
+                &mut ord,
+                base_sha,
+                &now,
             )?;
+            ids.push(parent.clone());
+            for child in &job.subjobs {
+                let leaf = insert_queued_job(
+                    tx,
+                    item_id,
+                    Some(&parent),
+                    &child.title,
+                    &child.acceptance,
+                    2,
+                    &mut ord,
+                    base_sha,
+                    &now,
+                )?;
+                ids.push(leaf);
+            }
         }
         tx.execute(
             "UPDATE items SET
@@ -1799,7 +1829,7 @@ pub fn validate_plan_json(document: &str) -> Result<PlanDocument> {
                 let job = entry
                     .as_object()
                     .ok_or_else(|| Error::Invalid("job must be an object".into()))?;
-                jobs.push(parse_plan_job(job, 1)?);
+                jobs.push(parse_plan_job(job)?);
             }
             jobs
         }
@@ -1827,53 +1857,71 @@ pub fn validate_plan_json(document: &str) -> Result<PlanDocument> {
     })
 }
 
-fn parse_plan_job(job: &serde_json::Map<String, serde_json::Value>, depth: i64) -> Result<PlanJob> {
-    let title = job
-        .get("title")
-        .and_then(serde_json::Value::as_str)
-        .filter(|title| !title.is_empty())
-        .ok_or_else(|| Error::Invalid("job title is required".into()))?;
-    let acceptance = match job.get("acceptance") {
-        None => String::new(),
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(_) => return Err(Error::Invalid("acceptance must be a string".into())),
-    };
+fn parse_plan_job(job: &serde_json::Map<String, serde_json::Value>) -> Result<PlanJob> {
+    let (title, acceptance) = job_title_acceptance(job)?;
     let subjobs = match job.get("subjobs") {
         None => Vec::new(),
-        // A subjob that itself has children is depth 3. Empty is still a leaf.
-        Some(serde_json::Value::Array(nested)) if depth >= 2 && !nested.is_empty() => {
-            return Err(Error::Invalid("depth 3 is not allowed".into()));
-        }
         Some(serde_json::Value::Array(nested)) => {
-            let mut children = Vec::with_capacity(nested.len());
+            let mut leaves = Vec::with_capacity(nested.len());
             for entry in nested {
                 let child = entry
                     .as_object()
                     .ok_or_else(|| Error::Invalid("job must be an object".into()))?;
-                children.push(parse_plan_job(child, depth + 1)?);
+                leaves.push(parse_plan_leaf(child)?);
             }
-            children
+            leaves
         }
         Some(_) => return Err(Error::Invalid("subjobs must be an array".into())),
     };
     Ok(PlanJob {
-        title: title.to_string(),
+        title,
         acceptance,
         subjobs,
     })
 }
 
-fn insert_plan_job(
+fn parse_plan_leaf(job: &serde_json::Map<String, serde_json::Value>) -> Result<PlanLeaf> {
+    // A leaf is the bottom. Children of a leaf would be depth 3.
+    match job.get("subjobs") {
+        None => {}
+        Some(serde_json::Value::Array(nested)) if nested.is_empty() => {}
+        Some(serde_json::Value::Array(_)) => {
+            return Err(Error::Invalid("depth 3 is not allowed".into()));
+        }
+        Some(_) => return Err(Error::Invalid("subjobs must be an array".into())),
+    }
+    let (title, acceptance) = job_title_acceptance(job)?;
+    Ok(PlanLeaf { title, acceptance })
+}
+
+fn job_title_acceptance(
+    job: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(String, String)> {
+    let title = job
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.is_empty())
+        .ok_or_else(|| Error::Invalid("job title is required".into()))?
+        .to_string();
+    let acceptance = match job.get("acceptance") {
+        None => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(_) => return Err(Error::Invalid("acceptance must be a string".into())),
+    };
+    Ok((title, acceptance))
+}
+
+fn insert_queued_job(
     tx: &Transaction,
     item_id: &str,
     parent: Option<&str>,
-    job: &PlanJob,
+    title: &str,
+    acceptance: &str,
     depth: i64,
     ord: &mut i64,
     base_sha: &str,
     now: &str,
-    ids: &mut Vec<String>,
-) -> Result<()> {
+) -> Result<String> {
     let job_id = new_id("j")?;
     let this_ord = *ord;
     *ord += 1;
@@ -1882,33 +1930,9 @@ fn insert_plan_job(
             id, item_id, parent_job_id, title, acceptance, state, depth, ord,
             base_sha, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
-        params![
-            job_id,
-            item_id,
-            parent,
-            job.title,
-            job.acceptance,
-            depth,
-            this_ord,
-            base_sha,
-            now
-        ],
+        params![job_id, item_id, parent, title, acceptance, depth, this_ord, base_sha, now],
     )?;
-    ids.push(job_id.clone());
-    for child in &job.subjobs {
-        insert_plan_job(
-            tx,
-            item_id,
-            Some(&job_id),
-            child,
-            depth + 1,
-            ord,
-            base_sha,
-            now,
-            ids,
-        )?;
-    }
-    Ok(())
+    Ok(job_id)
 }
 
 fn depth_conflict(state: impl AsState, err: Error) -> Error {
@@ -1963,46 +1987,42 @@ fn job_flags(tx: &Transaction, item_id: &str) -> Result<Vec<JobFlag>> {
 }
 
 fn promote_containers(tx: &Transaction, job_id: &str, now: &str) -> Result<()> {
-    // Product depth is 2. The cap only stops a corrupt parent cycle.
-    let mut current = job_id.to_string();
-    for _ in 0..8 {
-        let parent: Option<String> = tx
-            .query_row(
-                "SELECT parent_job_id FROM jobs WHERE id = ?1",
-                params![current],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        let Some(parent) = parent else {
-            return Ok(());
-        };
-        let pending: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = ?1 AND state != 'accepted'",
-            params![parent],
+    // Depth is 2, so a leaf has one container. Do not walk past that parent.
+    let parent: Option<String> = tx
+        .query_row(
+            "SELECT parent_job_id FROM jobs WHERE id = ?1",
+            params![job_id],
             |row| row.get(0),
-        )?;
-        if pending != 0 {
-            return Ok(());
-        }
-        let parent_job = load_job(tx, &parent)?;
-        if parent_job.state != JobState::Queued {
-            return Ok(());
-        }
-        clear_job_claim(tx, &parent, JobState::Accepted, now, None, None)?;
-        event(
-            tx,
-            now,
-            DAEMON,
-            Some(&parent_job.item_id),
-            Some(&parent),
-            "accept",
-            Some(parent_job.state.as_str()),
-            Some(JobState::Accepted.as_str()),
-            Some("container"),
-        )?;
-        current = parent;
+        )
+        .optional()?
+        .flatten();
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let pending: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE parent_job_id = ?1 AND state != 'accepted'",
+        params![parent],
+        |row| row.get(0),
+    )?;
+    if pending != 0 {
+        return Ok(());
     }
+    let parent_job = load_job(tx, &parent)?;
+    if parent_job.state != JobState::Queued {
+        return Ok(());
+    }
+    clear_job_claim(tx, &parent, JobState::Accepted, now, None, None)?;
+    event(
+        tx,
+        now,
+        DAEMON,
+        Some(&parent_job.item_id),
+        Some(&parent),
+        "accept",
+        Some(parent_job.state.as_str()),
+        Some(JobState::Accepted.as_str()),
+        Some("container"),
+    )?;
     Ok(())
 }
 
@@ -2993,7 +3013,7 @@ mod tests {
         assert_eq!(doc.jobs[0].title, "box");
         assert_eq!(doc.jobs[0].subjobs.len(), 2);
         assert_eq!(doc.jobs[0].subjobs[0].acceptance, "done");
-        assert!(doc.jobs[0].subjobs[1].subjobs.is_empty());
+        assert_eq!(doc.jobs[0].subjobs[1].title, "other");
         let doc = validate_plan_json(r#"{"summary":"s","jobs":[]}"#).unwrap();
         assert!(doc.jobs.is_empty());
         assert_eq!(doc.summary, "s");

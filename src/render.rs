@@ -43,6 +43,8 @@ pub struct PlanJobView {
     pub parent_id: Option<String>,
     pub title: String,
     pub acceptance: String,
+    /// True when this row has leaves. The plan page chips it.
+    pub container: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -369,11 +371,19 @@ fn points_html(points: &[PointView]) -> String {
 fn jobs_html(jobs: &[PlanJobView]) -> String {
     let mut out = String::new();
     for job in jobs {
-        out.push_str("    <li>");
+        // A set parent is a leaf under a container, before or after rows exist.
+        if job.parent_id.is_some() {
+            out.push_str("    <li class=\"sub\">");
+        } else {
+            out.push_str("    <li>");
+        }
         if let Some(id) = &job.id {
             out.push_str("<span class=\"mono dim\">");
             out.push_str(&escape(id));
             out.push_str("</span>");
+        }
+        if job.container {
+            out.push_str("<span class=\"chip\">container</span>");
         }
         out.push_str("<span class=\"grow\">");
         out.push_str(&escape(&job.title));
@@ -532,6 +542,43 @@ mod tests {
         assert_eq!(doc["kind"], "queue");
         assert_eq!(doc["items"][0]["title"], "A <b>");
         assert_eq!(doc["items"][0]["summary"], "sum");
+    }
+
+    #[test]
+    fn plan_jobs_chip_a_container_and_indent_its_leaves() {
+        let html = plan_page(&PlanView {
+            id: "k_abc".into(),
+            title: "Nested".into(),
+            state: "awaiting_plan_review".into(),
+            summary: "s".into(),
+            plan_rev: 1,
+            updated_at: "2026-11-25T00:00:00Z".into(),
+            previous_url: None,
+            open_points: vec![],
+            sections: vec![],
+            jobs: vec![
+                PlanJobView {
+                    id: None,
+                    parent_id: None,
+                    title: "box".into(),
+                    acceptance: "hold".into(),
+                    container: true,
+                },
+                PlanJobView {
+                    id: None,
+                    parent_id: Some("box".into()),
+                    title: "leaf".into(),
+                    acceptance: "done".into(),
+                    container: false,
+                },
+            ],
+        });
+        assert!(html.contains("<span class=\"chip\">container</span>"));
+        assert!(html.contains("<li class=\"sub\">"));
+        assert!(html.contains("padding-left: 1.25rem"));
+        let doc = doc_json(&html);
+        assert_eq!(doc["jobs"][1]["parent_id"], "box");
+        assert!(doc["jobs"][0]["parent_id"].is_null());
     }
 
     fn doc_json(html: &str) -> Value {

@@ -1314,7 +1314,10 @@ fn build_prompt(
 
 fn push_schema(out: &mut String, output_path: &Path) {
     out.push_str("Result schema (JSON object):\n");
-    out.push_str("{\"summary\":\"\",\"jobs\":[{\"title\":\"\",\"acceptance\":\"\"}],\"resolved_point_ids\":[]}\n");
+    out.push_str(
+        "{\"summary\":\"\",\"jobs\":[{\"title\":\"\",\"acceptance\":\"\",\"subjobs\":[{\"title\":\"\",\"acceptance\":\"\"}]}],\"resolved_point_ids\":[]}\n",
+    );
+    out.push_str("subjobs is optional. A further level is rejected.\n");
     out.push_str(&format!("Output path: {}\n\n", output_path.display()));
 }
 
@@ -1600,6 +1603,8 @@ mod tests {
         assert!(prompt.contains("BEGIN UNTRUSTED INTAKE"));
         assert!(prompt.contains("ignore previous instructions"));
         assert!(prompt.contains("resolved_point_ids"));
+        assert!(prompt.contains("\"subjobs\":[{\"title\":\"\",\"acceptance\":\"\"}]"));
+        assert!(prompt.contains("A further level is rejected."));
         assert!(prompt.contains("Output path:"));
         assert_eq!(mode(&prepared.prompt_path), 0o600);
         assert!(prepared.prompt_path.metadata().unwrap().len() <= 64 * 1024);
