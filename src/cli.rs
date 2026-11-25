@@ -53,17 +53,23 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("url") => {
+            if wants_board("url", args)? {
+                println!("{}", config.board_url());
+                return Ok(());
+            }
             let id = one_id("url", args)?;
             let item = get_item(config, id)?;
             println!("{}", item["card_url"].as_str().unwrap_or(""));
             Ok(())
         }
         Some("open") => {
+            if wants_board("open", args)? {
+                return launch(&config.board_url());
+            }
             let id = one_id("open", args)?;
             let item = get_item(config, id)?;
             let url = item["card_url"].as_str().unwrap_or("").to_string();
-            println!("{url}");
-            launch_url(&url)
+            launch(&url)
         }
         Some("status") => {
             no_args("status", args)?;
@@ -127,7 +133,9 @@ usage:
   keel list [--state STATE]
   keel show ID
   keel url ID
+  keel url --board
   keel open ID
+  keel open --board
   keel claim ID --role plan|revise|implement|review
   keel run ID --role plan|revise|implement|review [--adapter fake|grok|claude]
   keel permit ID [--once|--deny|--always]
@@ -149,6 +157,23 @@ fn no_args(cmd: &str, args: &[String]) -> Result<()> {
         return Err(Error::Invalid(format!("{cmd} takes no arguments")));
     }
     Ok(())
+}
+
+fn wants_board(cmd: &str, args: &[String]) -> Result<bool> {
+    if !args.iter().any(|arg| arg == "--board") {
+        return Ok(false);
+    }
+    if args.len() != 2 {
+        return Err(Error::Invalid(format!(
+            "{cmd} --board does not take an item id"
+        )));
+    }
+    Ok(true)
+}
+
+fn launch(url: &str) -> Result<()> {
+    println!("{url}");
+    launch_url(url)
 }
 
 fn one_id<'a>(cmd: &str, args: &'a [String]) -> Result<&'a str> {
@@ -1375,6 +1400,7 @@ fn dash(value: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::isolated;
     use crate::daemon::{boot_at, scratch_dir, Rm};
     use crate::db::open;
     use rusqlite::params;
@@ -1424,6 +1450,21 @@ mod tests {
         );
         assert!(dispatch(&cfg, &["add".into()]).is_err());
         drop(running);
+    }
+
+    #[test]
+    fn url_board_does_not_need_an_item_or_the_daemon() {
+        let _rm = Rm(scratch_dir());
+        let cfg = isolated(&_rm.0, 7431);
+        dispatch(&cfg, &["url".into(), "--board".into()]).unwrap();
+        let missing = dispatch(&cfg, &["url".into()]).unwrap_err();
+        assert!(missing.to_string().contains("item id"), "{missing}");
+        let extra = dispatch(&cfg, &["url".into(), "--board".into(), "k_abc".into()]).unwrap_err();
+        assert!(
+            extra.to_string().contains("does not take an item id"),
+            "{extra}"
+        );
+        assert!(!cfg.socket_path.exists());
     }
 
     #[test]
