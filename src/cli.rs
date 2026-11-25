@@ -63,17 +63,17 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
             let item = get_item(config, id)?;
             let url = item["card_url"].as_str().unwrap_or("").to_string();
             println!("{url}");
-            let status = Command::new("xdg-open").arg(&url).status()?;
-            if !status.success() {
-                return Err(Error::Invalid(format!("xdg-open exited ({status})")));
-            }
-            Ok(())
+            launch_url(&url)
         }
         Some("status") => {
             no_args("status", args)?;
             let status = daemon_json(config, "GET", "/v1/status", None)?;
             print!("{}", render_status(&status));
             Ok(())
+        }
+        Some("tui") => {
+            no_args("tui", args)?;
+            crate::tui::run(config)
         }
         Some("claim") => claim_cmd(config, &args[1..]),
         Some("run") => run_cmd(config, &args[1..]),
@@ -100,6 +100,7 @@ fn usage() -> &'static str {
 usage:
   keel serve
   keel status
+  keel tui
   keel add [--repo PATH] [--branch NAME] [--body TEXT] TITLE
   keel inbox
   keel list [--state STATE]
@@ -1065,11 +1066,16 @@ fn get_item(config: &Config, id: &str) -> Result<Value> {
     daemon_json(config, "GET", &format!("/v1/items/{id}"), None)
 }
 
-fn daemon_json(config: &Config, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Value> {
+pub(crate) fn daemon_json(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> Result<Value> {
     daemon_json_timeout(config, method, path, body, Duration::from_secs(5))
 }
 
-fn daemon_json_timeout(
+pub(crate) fn daemon_json_timeout(
     config: &Config,
     method: &str,
     path: &str,
@@ -1174,6 +1180,15 @@ fn start_and_connect(config: &Config) -> Result<UnixStream> {
 
 extern "C" {
     fn setsid() -> i32;
+}
+
+/// `xdg-open` of a daemon URL. `keel open` and the TUI both use this.
+pub(crate) fn launch_url(url: &str) -> Result<()> {
+    let status = Command::new("xdg-open").arg(url).status()?;
+    if !status.success() {
+        return Err(Error::Invalid(format!("xdg-open exited ({status})")));
+    }
+    Ok(())
 }
 
 fn url_encode(value: &str) -> String {

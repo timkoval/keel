@@ -13,5 +13,6 @@ pub(crate) mod http;
 pub(crate) mod proc;
 pub(crate) mod render;
 pub mod state;
+pub(crate) mod tui;
 
 pub use db::{open, Error, Result};
