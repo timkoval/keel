@@ -169,17 +169,25 @@ pub fn release(
     target: Target,
     id: &str,
     mut release: Release,
+    data_dir: &Path,
 ) -> Result<String> {
     let mut conn = lock_db(db)?;
     // The body cannot claim a live pid is gone. A null pid stays not-gone,
     // so expiry still refuses the pre-spawn window.
     release.pid_gone = pid_is_gone(&conn, target, id)?;
+    // Read before the transition. It clears claim_role. Implement and review
+    // checkouts stay: the next claim reuses them. Plan and revise are removed
+    // on release and on expiry, outside this mutex.
+    let plan_tree = plan_revise_worktree(&conn, target, id, data_dir)?;
     match target {
         Target::Item => state::release_item(&mut conn, id, release)?,
         Target::Job => state::release_job(&mut conn, id, release)?,
     }
     let state_name = read_text(&conn, target, id, "state", "state is missing")?;
     drop(conn);
+    if let Some((repo, path)) = plan_tree {
+        git::remove_worktree(&repo, &path)?;
+    }
     Ok(state_name)
 }
 
@@ -592,6 +600,42 @@ fn latest_note(conn: &Connection, job_id: &str) -> Result<Option<String>> {
 
 /// No spawned child. Human release with force clears an external pid that is
 /// still the MCP client, and a null pid, without taking the expiry path.
+/// Plan and revise use a fixed slot. The next claim adds it again, so a
+/// successful release has to remove the detached checkout. Job worktrees are
+/// not in this path.
+fn plan_revise_worktree(
+    conn: &Connection,
+    target: Target,
+    id: &str,
+    data_dir: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    if target != Target::Item || !crate::render::safe_id(id) {
+        return Ok(None);
+    }
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT claim_role, repo FROM items WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((role, repo)) = row else {
+        return Ok(None);
+    };
+    let slot = match role.as_deref() {
+        Some("plan") => "plan",
+        Some("revise") => "revise",
+        _ => return Ok(None),
+    };
+    let Some(repo) = repo.filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        PathBuf::from(repo),
+        data_dir.join("worktrees").join(id).join(slot),
+    )))
+}
+
 fn undo_claim(conn: &mut Connection, target: Target, id: &str) -> Result<()> {
     let release = Release {
         cause: ReleaseCause::Human,
@@ -683,7 +727,6 @@ fn prepare_workspace(db: &Mutex<Connection>, data_dir: &Path, facts: &Facts) -> 
     if let Some(parent) = worktree.parent() {
         fs::create_dir_all(parent)?;
     }
-    partial.worktree = Some(worktree.clone());
 
     let mut diff_path = None;
     let mut truncated = false;
@@ -696,16 +739,16 @@ fn prepare_workspace(db: &Mutex<Connection>, data_dir: &Path, facts: &Facts) -> 
                 .filter(|branch| !branch.is_empty())
                 .ok_or_else(|| Error::Invalid("target_branch is unset".into()))?;
             let head = git::rev_parse(&repo, branch)?;
-            git::add_detached(&repo, &worktree, &head)?;
+            place_worktree(&mut partial, &repo, &worktree, facts.role, "", &head)?;
         }
         Role::Implement => {
             let base = required_sha(facts.base_sha.as_deref(), "base_sha")?;
             let branch = job_branch(&facts.item_id, &facts.id);
-            git::add_branch(&repo, &worktree, &branch, &base)?;
-            partial.branch = Some(branch);
+            place_worktree(&mut partial, &repo, &worktree, facts.role, &branch, &base)?;
         }
         Role::Review => {
             let base = required_sha(facts.base_sha.as_deref(), "base_sha")?;
+            place_worktree(&mut partial, &repo, &worktree, facts.role, "", &base)?;
             if let Some(diff_ref) = facts.diff_ref.as_deref().filter(|rev| !rev.is_empty()) {
                 let path = data_dir.join("diffs").join(format!("{}.diff", facts.id));
                 partial.diff_path = Some(path.clone());
@@ -714,7 +757,6 @@ fn prepare_workspace(db: &Mutex<Connection>, data_dir: &Path, facts: &Facts) -> 
                 diff_stat = written.1;
                 diff_path = Some(path);
             }
-            git::add_detached(&repo, &worktree, &base)?;
         }
     }
 
@@ -731,11 +773,9 @@ fn prepare_workspace(db: &Mutex<Connection>, data_dir: &Path, facts: &Facts) -> 
     );
     write_prompt(&prompt_path, &text)?;
     if facts.role == Role::Implement {
-        let branch = partial
-            .branch
-            .as_deref()
-            .ok_or_else(|| Error::Invalid("implement branch was not created".into()))?;
-        record_job(db, &facts.id, &facts.claim.token, &worktree, branch)?;
+        // Reuse leaves `partial.branch` empty. The name is still this job's.
+        let branch = job_branch(&facts.item_id, &facts.id);
+        record_job(db, &facts.id, &facts.claim.token, &worktree, &branch)?;
     }
     partial.keep = true;
     Ok(prepared(
@@ -763,6 +803,50 @@ fn prepared(
         diff_path,
         snapshot,
     }
+}
+
+/// Create the slot, or reuse an implement/review checkout this role already owns.
+/// A reused path is not recorded on `partial`, so a later prompt failure cannot
+/// delete the branch or the kept worktree. Plan and revise are never reused.
+fn place_worktree(
+    partial: &mut PartialTree,
+    repo: &Path,
+    worktree: &Path,
+    role: Role,
+    branch: &str,
+    rev: &str,
+) -> Result<()> {
+    if let Some(found) = git::linked_checkout(repo, worktree)? {
+        let reuse = match role {
+            Role::Implement => found.branch == branch,
+            Role::Review => found.branch == "HEAD" && found.head == rev,
+            Role::Plan | Role::Revise => false,
+        };
+        if reuse {
+            return Ok(());
+        }
+        return Err(Error::Invalid(format!(
+            "worktree {} is not the checkout this role created",
+            worktree.display()
+        )));
+    }
+    match role {
+        Role::Implement => {
+            if git::branch_exists(repo, branch)? {
+                git::add_existing_branch(repo, worktree, branch)?;
+                partial.worktree = Some(worktree.to_path_buf());
+            } else {
+                git::add_branch(repo, worktree, branch, rev)?;
+                partial.worktree = Some(worktree.to_path_buf());
+                partial.branch = Some(branch.to_string());
+            }
+        }
+        Role::Plan | Role::Revise | Role::Review => {
+            git::add_detached(repo, worktree, rev)?;
+            partial.worktree = Some(worktree.to_path_buf());
+        }
+    }
+    Ok(())
 }
 
 fn required_sha<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str> {
@@ -1102,7 +1186,7 @@ mod tests {
         assert!(token.is_none());
 
         claim_and_prepare(&db, Target::Item, &id, &plan_input(), &dir).unwrap();
-        let err = release(&db, Target::Item, &id, Release::expiry(true)).unwrap_err();
+        let err = release(&db, Target::Item, &id, Release::expiry(true), &dir).unwrap_err();
         assert!(err.to_string().contains("null claim_pid"), "{err}");
         let state_name: String = db
             .lock()
@@ -1116,7 +1200,7 @@ mod tests {
         assert_eq!(state_name, "planning");
 
         // Non-external unsupervised window. Human release clears it without a token.
-        release(&db, Target::Item, &id, Release::human()).unwrap();
+        release(&db, Target::Item, &id, Release::human(), &dir).unwrap();
         let state_name: String = db
             .lock()
             .unwrap()
@@ -1151,17 +1235,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(external, 1);
-        let err = release(&db, Target::Item, &id, Release::expiry(true)).unwrap_err();
+        let err = release(&db, Target::Item, &id, Release::expiry(true), &dir).unwrap_err();
         assert!(err.to_string().contains("still live"), "{err}");
-        let err = release(&db, Target::Item, &id, Release::human()).unwrap_err();
+        let err = release(&db, Target::Item, &id, Release::human(), &dir).unwrap_err();
         assert!(err.to_string().contains("force"), "{err}");
         let mut mcp = Release::human();
         mcp.claim_token = Some(prepared.claim.token);
-        let err = release(&db, Target::Item, &id, mcp).unwrap_err();
+        let err = release(&db, Target::Item, &id, mcp, &dir).unwrap_err();
         assert!(err.to_string().contains("still live"), "{err}");
         let mut forced = Release::human();
         forced.force = true;
-        release(&db, Target::Item, &id, forced).unwrap();
+        release(&db, Target::Item, &id, forced, &dir).unwrap();
     }
 
     #[test]
@@ -1213,6 +1297,20 @@ mod tests {
             let mut conn = db.lock().unwrap();
             state::create_item(&mut conn, raw).unwrap()
         };
+        let hook = repo.join(".git/hooks/post-checkout");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho hooked >> {}\n",
+                repo.join("README").display()
+            ),
+        )
+        .unwrap();
+        let mut hook_mode = fs::metadata(&hook).unwrap().permissions();
+        hook_mode.set_mode(0o755);
+        fs::set_permissions(&hook, hook_mode).unwrap();
+
         let before = git::rev_parse(&repo, "HEAD").unwrap();
         let prepared = claim_and_prepare(&db, Target::Item, &id, &plan_input(), &root).unwrap();
         assert_eq!(git::rev_parse(&repo, "HEAD").unwrap(), before);
@@ -1234,8 +1332,14 @@ mod tests {
         assert!(prompt.contains("Output path:"));
         assert_eq!(mode(&prepared.prompt_path), 0o600);
         assert!(prepared.prompt_path.metadata().unwrap().len() <= 64 * 1024);
+        assert_eq!(fs::read_to_string(repo.join("README")).unwrap(), "one\n");
 
-        release(&db, Target::Item, &id, Release::human()).unwrap();
+        release(&db, Target::Item, &id, Release::human(), &root).unwrap();
+        assert!(!worktree.exists());
+        let again = claim_and_prepare(&db, Target::Item, &id, &plan_input(), &root).unwrap();
+        assert!(again.worktree.expect("second plan worktree").is_dir());
+        release(&db, Target::Item, &id, Release::human(), &root).unwrap();
+        assert!(!worktree.exists());
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -1310,6 +1414,7 @@ mod tests {
                 claim_token: None,
                 pid_gone: false,
             },
+            &root,
         )
         .unwrap();
 
@@ -1416,7 +1521,7 @@ mod tests {
         assert_eq!(stored.0, worktree.display().to_string());
         assert_eq!(stored.1, branch);
 
-        release(&db, Target::Job, "j_leaf", Release::human()).unwrap();
+        release(&db, Target::Job, "j_leaf", Release::human(), &root).unwrap();
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -1460,10 +1565,9 @@ mod tests {
                 claim_token: None,
                 pid_gone: false,
             },
+            &root,
         )
         .unwrap();
-        let review_tree = root.join("worktrees").join(&item).join("j_leaf-review");
-        git::remove_worktree(&repo, &review_tree).unwrap();
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -1494,6 +1598,12 @@ mod tests {
         let root = scratch_dir();
         let repo = root.join("repo");
         let base = git::init_repo(&repo);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "color.ui", "always"])
+            .status()
+            .unwrap();
         let diff_ref = git::commit_file(&repo, "big.bin", &vec![b'a'; 1_100_000]);
         let before = git::rev_parse(&repo, "HEAD").unwrap();
         let db = Mutex::new(open_in_memory().unwrap());
@@ -1535,6 +1645,67 @@ mod tests {
         assert!(prompt.contains("truncated to 1 MiB"), "{prompt}");
         assert!(prompt.contains("git diff --stat:"), "{prompt}");
         assert!(prompt.contains("big.bin"), "{prompt}");
+        assert!(!prompt.contains('\u{1b}'), "{prompt}");
+        assert!(!diff.contains(&0x1b));
         assert!(prepared.prompt_path.metadata().unwrap().len() <= 64 * 1024);
+    }
+
+    #[test]
+    fn implement_release_reclaims_the_same_worktree() {
+        let root = scratch_dir();
+        let repo = root.join("repo");
+        let base = git::init_repo(&repo);
+        let primary = git::rev_parse(&repo, "HEAD").unwrap();
+        let db = Mutex::new(open_in_memory().unwrap());
+        let mut raw = intake();
+        raw.repo = Some(repo.clone());
+        raw.target_branch = Some("main".into());
+        let item = {
+            let mut conn = db.lock().unwrap();
+            state::create_item(&mut conn, raw).unwrap()
+        };
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE items SET state = 'awaiting_implementation', base_sha = ?1 WHERE id = ?2",
+                params![base, item],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (
+                    id, item_id, title, acceptance, state, depth, ord, base_sha, updated_at
+                 ) VALUES (
+                    'j_keep', ?1, 'Keep', '', 'queued', 1, 0, ?2, '2026-11-25T00:00:00Z'
+                 )",
+                params![item, base],
+            )
+            .unwrap();
+        }
+        let implement = ClaimInput {
+            role: Role::Implement,
+            adapter: Some("fake".into()),
+            worker_id: Some("fake:impl".into()),
+            pid: None,
+        };
+        let prepared = claim_and_prepare(&db, Target::Job, "j_keep", &implement, &root).unwrap();
+        let worktree = prepared.worktree.expect("worktree");
+        let branch = format!("keel/{item}/j_keep");
+        let committed = git::commit_file(&worktree, "again.txt", b"again\n");
+        assert_ne!(committed, base);
+        assert_eq!(git::rev_parse(&repo, "HEAD").unwrap(), primary);
+
+        release(&db, Target::Job, "j_keep", Release::human(), &root).unwrap();
+        assert!(worktree.is_dir());
+        assert!(git::branch_exists(&repo, &branch).unwrap());
+
+        let again = claim_and_prepare(&db, Target::Job, "j_keep", &implement, &root).unwrap();
+        let reused = again.worktree.expect("reused worktree");
+        assert_eq!(reused, worktree);
+        let tree = git::snapshot(&reused).unwrap();
+        assert_eq!(tree.branch, branch);
+        assert_eq!(tree.head, committed);
+        assert_eq!(git::rev_parse(&repo, "HEAD").unwrap(), primary);
+        assert_eq!(again.snapshot.expect("snapshot").head, primary);
+        assert!(git::branch_exists(&repo, &branch).unwrap());
     }
 }

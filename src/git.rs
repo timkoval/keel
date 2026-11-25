@@ -55,7 +55,80 @@ pub(crate) fn add_branch(repo: &Path, dest: &Path, branch: &str, rev: &str) -> R
     Ok(())
 }
 
+/// Attach a checkout to a branch that already exists. Does not create or delete it.
+pub(crate) fn add_existing_branch(repo: &Path, dest: &Path, branch: &str) -> Result<()> {
+    check_rev(branch)?;
+    let dest = path_arg(dest)?;
+    git_ok(repo, &["worktree", "add", dest, branch])?;
+    Ok(())
+}
+
+pub(crate) fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    check_rev(branch)?;
+    let spec = format!("refs/heads/{branch}");
+    let output = git_cmd(repo, &["show-ref", "--verify", "--quiet", &spec])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(git_failure(
+            &["show-ref", "--verify", "--quiet", &spec],
+            &output,
+        )),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinkedCheckout {
+    pub head: String,
+    /// `HEAD` when the checkout is detached.
+    pub branch: String,
+}
+
+/// `Ok(None)` when `dest` is absent. An existing path that is not this repo's
+/// checkout is an error: the caller must not delete it to force `worktree add`.
+pub(crate) fn linked_checkout(repo: &Path, dest: &Path) -> Result<Option<LinkedCheckout>> {
+    if !dest.exists() {
+        return Ok(None);
+    }
+    let dest_common = git_text(
+        dest,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_err(|_| {
+        Error::Invalid(format!(
+            "worktree path {} exists and is not a checkout of this repo",
+            dest.display()
+        ))
+    })?;
+    let repo_common = git_text(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    if !same_dir(dest_common.trim(), repo_common.trim())? {
+        return Err(Error::Invalid(format!(
+            "worktree path {} belongs to a different repository",
+            dest.display()
+        )));
+    }
+    let head = rev_parse(dest, "HEAD")?;
+    let branch = git_text(dest, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    Ok(Some(LinkedCheckout {
+        head,
+        branch: branch.trim_end().to_string(),
+    }))
+}
+
+fn same_dir(left: &str, right: &str) -> Result<bool> {
+    let left = std::fs::canonicalize(left)?;
+    let right = std::fs::canonicalize(right)?;
+    Ok(left == right)
+}
+
 pub(crate) fn remove_worktree(repo: &Path, dest: &Path) -> Result<()> {
+    // A release of a claim that never created the slot is still success.
+    if !dest.exists() {
+        return Ok(());
+    }
     let dest = path_arg(dest)?;
     git_ok(repo, &["worktree", "remove", "--force", dest])?;
     Ok(())
@@ -71,13 +144,13 @@ pub(crate) fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
 pub(crate) fn diff_bytes(repo: &Path, base: &str, other: &str) -> Result<Vec<u8>> {
     check_rev(base)?;
     check_rev(other)?;
-    git_diff(repo, &["diff", base, other])
+    git_diff(repo, &["diff", "--no-color", base, other])
 }
 
 pub(crate) fn diff_stat(repo: &Path, base: &str, other: &str) -> Result<String> {
     check_rev(base)?;
     check_rev(other)?;
-    let bytes = git_diff(repo, &["diff", "--stat", base, other])?;
+    let bytes = git_diff(repo, &["diff", "--no-color", "--stat", base, other])?;
     String::from_utf8(bytes).map_err(|_| Error::Invalid("git diff --stat is not utf-8".into()))
 }
 
@@ -130,7 +203,15 @@ fn git_failure(args: &[&str], output: &Output) -> Error {
 
 fn git_cmd(repo: &Path, args: &[&str]) -> Result<Output> {
     let mut cmd = Command::new("git");
-    cmd.arg("--no-pager").arg("-C").arg(repo);
+    // Hooks run before the primary snapshot. A post-checkout hook could move
+    // that checkout. Color would also spend the review diff cap on ANSI.
+    cmd.arg("--no-pager")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("color.ui=false")
+        .arg("-C")
+        .arg(repo);
     cmd.args(args.iter().copied().map(OsStr::new));
     // A parent GIT_DIR would make `-C` operate on the wrong repository.
     for key in [

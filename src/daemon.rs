@@ -338,7 +338,7 @@ fn mutate_response(
                 Ok(release) => release,
                 Err(err) => return fail(err),
             };
-            match claim::release(&shared.db, target, id, release) {
+            match claim::release(&shared.db, target, id, release, &shared.config.data_dir) {
                 Ok(state) => Response::json(
                     200,
                     json!({
@@ -1041,7 +1041,8 @@ fn submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
             Ok(conn) => conn,
             Err(err) => return fail(err),
         };
-        // Snapshot enforcement is a later submit. The claim already recorded one.
+        // Snapshot enforcement is a later submit. The claim returns one to the
+        // caller and does not store it until a column exists.
         let tree = state::DetachedWorktree::unchanged();
         let result = match read_item_state(&conn, id) {
             Ok(state_name) => match state_name.as_str() {
