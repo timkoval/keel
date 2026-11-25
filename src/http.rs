@@ -14,6 +14,7 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -68,27 +69,64 @@ pub fn status_code(err: &Error) -> u16 {
     }
 }
 
+#[cfg(test)]
 pub fn exchange<S: Read + Write>(
     stream: &mut S,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
 ) -> Result<Response> {
-    write_request(stream, method, path, body)?;
+    exchange_with(stream, method, path, body, &[])
+}
+
+pub fn exchange_with<S: Read + Write>(
+    stream: &mut S,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+) -> Result<Response> {
+    write_request_with(stream, method, path, body, headers)?;
     read_response(stream)
 }
 
+#[cfg(test)]
 pub fn write_request<S: Write>(
     stream: &mut S,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
 ) -> Result<()> {
+    write_request_with(stream, method, path, body, &[])
+}
+
+pub fn write_request_with<S: Write>(
+    stream: &mut S,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+) -> Result<()> {
     let body = body.unwrap_or(b"");
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n",
         body.len()
     );
+    for (name, value) in headers {
+        if name.is_empty()
+            || value.bytes().any(|byte| byte == b'\r' || byte == b'\n')
+            || name
+                .bytes()
+                .any(|byte| byte == b'\r' || byte == b'\n' || byte == b':')
+        {
+            return Err(Error::Invalid("bad header".into()));
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()?;
@@ -112,6 +150,7 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
     }
     let (path, query) = split_target(target);
     let mut content_length = 0usize;
+    let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -119,14 +158,19 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
         let Some((name, value)) = line.split_once(':') else {
             return Err(Error::Invalid("bad header".into()));
         };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
+            return Err(Error::Invalid("bad header".into()));
+        }
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value
-                .trim()
                 .parse()
                 .map_err(|_| Error::Invalid("bad content-length".into()))?;
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(Error::Invalid("chunked bodies are not accepted".into()));
         }
+        headers.push((name.to_string(), value.to_string()));
     }
     if content_length > BODY_MAX {
         return Err(Error::Invalid("request exceeds the socket body cap".into()));
@@ -136,6 +180,7 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
         method,
         path,
         query,
+        headers,
         body,
     })
 }
@@ -292,6 +337,13 @@ pub fn query<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+pub fn header<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -325,6 +377,24 @@ mod tests {
         assert_eq!(req.path, "/v1/items");
         assert_eq!(query(&req.query, "state"), Some("a+b c"));
         assert_eq!(req.body, br#"{"title":"a"}"#);
+        assert!(req.headers.iter().any(|(name, _)| name == "Host"));
+    }
+
+    #[test]
+    fn surface_header_roundtrip() {
+        let mut buf = Vec::new();
+        write_request_with(
+            &mut buf,
+            "POST",
+            "/v1/items/k_1/release",
+            Some(b"{}"),
+            &[("x-keel-surface", "cli")],
+        )
+        .unwrap();
+        let mut cur = Cursor::new(buf);
+        let req = read_request(&mut cur).unwrap();
+        assert_eq!(header(&req.headers, "X-Keel-Surface"), Some("cli"));
+        assert_eq!(req.body, b"{}");
     }
 
     #[test]

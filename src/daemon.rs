@@ -1,5 +1,5 @@
-//! One process owns the database. The Unix socket is the only mutation path in
-//! this slice (`POST /v1/items`). `127.0.0.1` serves GET document routes only.
+//! One process owns the database. Mutations stay on the Unix socket.
+//! `127.0.0.1` serves GET document routes only.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -18,6 +18,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
+use crate::claim::{self, Target};
 use crate::config::Config;
 use crate::db::{open, Error, Result};
 use crate::http::{self, Request, Response};
@@ -238,6 +239,11 @@ fn route_unix(req: &Request, shared: &Shared) -> Response {
         ("POST", "/v1/items") => create_response(shared, &req.body),
         ("GET", "/v1/items") => list_response(shared, http::query(&req.query, "state")),
         ("GET", "/v1/status") => status_response(shared),
+        ("GET", "/v1/resolve") => resolve_response(shared, http::query(&req.query, "id")),
+        ("POST", path) => match action_route(path) {
+            Some((target, id, action)) => mutate_response(shared, req, target, id, action),
+            None => missing(path),
+        },
         ("GET", path) if path.starts_with("/v1/items/") => {
             let id = &path["/v1/items/".len()..];
             if id.contains('/') || !render::safe_id(id) {
@@ -245,8 +251,116 @@ fn route_unix(req: &Request, shared: &Shared) -> Response {
             }
             item_response(shared, id)
         }
-        ("GET" | "POST", _) => missing(&req.path),
+        ("GET", _) => missing(&req.path),
         _ => method_not_allowed("GET, POST"),
+    }
+}
+
+fn action_route(path: &str) -> Option<(Target, &str, &str)> {
+    let mut parts = path.split('/');
+    if parts.next() != Some("") || parts.next() != Some("v1") {
+        return None;
+    }
+    let target = match parts.next() {
+        Some("items") => Target::Item,
+        Some("jobs") => Target::Job,
+        _ => return None,
+    };
+    let id = parts.next()?;
+    let action = parts.next()?;
+    if parts.next().is_some() || !render::safe_id(id) {
+        return None;
+    }
+    if !matches!(action, "claim" | "heartbeat" | "release") {
+        return None;
+    }
+    Some((target, id, action))
+}
+
+fn mutate_response(
+    shared: &Shared,
+    req: &Request,
+    target: Target,
+    id: &str,
+    action: &str,
+) -> Response {
+    let surface_cli = http::header(&req.headers, "x-keel-surface") == Some("cli");
+    match action {
+        "claim" => {
+            let input = match claim::parse_claim(&req.body) {
+                Ok(input) => input,
+                Err(err) => return fail(err),
+            };
+            match claim::claim_and_prepare(&shared.db, target, id, &input) {
+                Ok(prepared) => Response::json(
+                    200,
+                    json!({
+                        "id": prepared.id,
+                        "kind": prepared.target.as_str(),
+                        "role": prepared.claim.role.as_str(),
+                        "claim_token": prepared.claim.token,
+                        "worker_id": prepared.claim.worker_id,
+                        "lease_until": prepared.claim.lease_until,
+                    }),
+                ),
+                Err(err) => fail(err),
+            }
+        }
+        "heartbeat" => {
+            let token = match claim::parse_heartbeat(&req.body) {
+                Ok(token) => token,
+                Err(err) => return fail(err),
+            };
+            match claim::heartbeat(&shared.db, target, id, &token) {
+                Ok(lease_until) => Response::json(
+                    200,
+                    json!({
+                        "id": id,
+                        "kind": target.as_str(),
+                        "lease_until": lease_until,
+                    }),
+                ),
+                Err(err) => fail(err),
+            }
+        }
+        "release" => {
+            let release = match claim::parse_release(&req.body, surface_cli) {
+                Ok(release) => release,
+                Err(err) => return fail(err),
+            };
+            match claim::release(&shared.db, target, id, release) {
+                Ok(state) => Response::json(
+                    200,
+                    json!({
+                        "id": id,
+                        "kind": target.as_str(),
+                        "state": state,
+                    }),
+                ),
+                Err(err) => fail(err),
+            }
+        }
+        _ => missing(action),
+    }
+}
+
+fn resolve_response(shared: &Shared, id: Option<&str>) -> Response {
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return fail(Error::Invalid("id is required".into()));
+    };
+    let conn = match lock_db(&shared.db) {
+        Ok(conn) => conn,
+        Err(err) => return fail(err),
+    };
+    match claim::resolve_id(&conn, id) {
+        Ok(resolved) => Response::json(
+            200,
+            json!({
+                "id": resolved.id,
+                "kind": resolved.target.as_str(),
+            }),
+        ),
+        Err(err) => fail(err),
     }
 }
 
@@ -1191,6 +1305,387 @@ mod tests {
             .iter()
             .all(|event| event["detail"] != "n0" && event["detail"] != "n1"));
         assert!(events.iter().all(|event| event["kind"] != "create"));
+        drop(running);
+    }
+
+    fn post(cfg: &Config, path: &str, body: Value) -> Response {
+        api(cfg, "POST", path, Some(body.to_string().as_bytes()))
+    }
+
+    fn post_cli(cfg: &Config, path: &str, body: Value) -> Response {
+        let mut stream = UnixStream::connect(&cfg.socket_path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        http::exchange_with(
+            &mut stream,
+            "POST",
+            path,
+            Some(body.to_string().as_bytes()),
+            &[("x-keel-surface", "cli")],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn claim_heartbeat_release_stay_off_the_document_port() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let created = post_item(&cfg, "Claim me", "body");
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let claimed = post(
+            &cfg,
+            &format!("/v1/items/{id}/claim"),
+            json!({"role": "plan", "adapter": "cli"}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let claimed: Value = serde_json::from_slice(&claimed.body).unwrap();
+        let token = claimed["claim_token"].as_str().unwrap().to_string();
+        assert!(claimed.get("worktree").is_none());
+        assert!(claimed.get("prompt_path").is_none());
+        let pid: Option<i64> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_pid FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pid.is_none());
+
+        let expired = post(
+            &cfg,
+            &format!("/v1/items/{id}/release"),
+            json!({"cause": "expiry", "pid_gone": true}),
+        );
+        assert_eq!(
+            expired.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&expired.body)
+        );
+        assert!(String::from_utf8_lossy(&expired.body).contains("null claim_pid"));
+        let state: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "planning");
+
+        let bare = post(&cfg, &format!("/v1/items/{id}/release"), json!({}));
+        assert_eq!(bare.status, 400, "{}", String::from_utf8_lossy(&bare.body));
+        assert!(String::from_utf8_lossy(&bare.body).contains("claim_token"));
+
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE items SET lease_until = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let beat = post(
+            &cfg,
+            &format!("/v1/items/{id}/heartbeat"),
+            json!({"claim_token": token}),
+        );
+        assert_eq!(beat.status, 200, "{}", String::from_utf8_lossy(&beat.body));
+        let beat: Value = serde_json::from_slice(&beat.body).unwrap();
+        assert_ne!(beat["lease_until"], "2000-01-01T00:00:00Z");
+
+        let tcp_claim = tcp(
+            &cfg,
+            "POST",
+            &format!("/v1/items/{id}/claim"),
+            Some(br#"{"role":"plan"}"#),
+        );
+        assert_eq!(tcp_claim.status, 405);
+        let tcp_release = tcp(
+            &cfg,
+            "POST",
+            &format!("/v1/items/{id}/release"),
+            Some(b"{}"),
+        );
+        assert_eq!(tcp_release.status, 405);
+        let tcp_resolve = tcp(&cfg, "GET", &format!("/v1/resolve?id={id}"), None);
+        assert_eq!(tcp_resolve.status, 404);
+
+        let released = post_cli(&cfg, &format!("/v1/items/{id}/release"), json!({}));
+        assert_eq!(
+            released.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&released.body)
+        );
+        let released: Value = serde_json::from_slice(&released.body).unwrap();
+        assert_eq!(released["state"], "inbox");
+        drop(running);
+    }
+
+    #[test]
+    fn missing_token_does_not_expire_an_external_lease() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let created = post_item(&cfg, "External", "body");
+        let id = created["id"].as_str().unwrap().to_string();
+        let claimed = post(
+            &cfg,
+            &format!("/v1/items/{id}/claim"),
+            json!({"role": "plan", "adapter": "mcp", "pid": std::process::id()}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let external: i64 = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_external FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(external, 1);
+        let pgid: Option<i64> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_pgid FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pgid.is_none());
+
+        // The recorded pid is dead, so a real expiry would clear the row.
+        // A body with no token must not take that path.
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE items SET claim_pid = 2147483646, claim_starttime = '1' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let bare = post(&cfg, &format!("/v1/items/{id}/release"), json!({}));
+        assert_eq!(bare.status, 400, "{}", String::from_utf8_lossy(&bare.body));
+        let state: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "planning");
+
+        let expired = post(
+            &cfg,
+            &format!("/v1/items/{id}/release"),
+            json!({"cause": "expiry"}),
+        );
+        assert_eq!(
+            expired.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&expired.body)
+        );
+        let state: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "inbox");
+        drop(running);
+    }
+
+    #[test]
+    fn fake_adapter_heartbeats_the_job_route() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let created = post_item(&cfg, "Implement", "body");
+        let item_id = created["id"].as_str().unwrap().to_string();
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE items SET state = 'awaiting_implementation' WHERE id = ?1",
+                params![item_id],
+            )
+            .unwrap();
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, item_id, title, acceptance, state, depth, ord, updated_at)
+                 VALUES ('j_impl', ?1, 'Leaf', '', 'queued', 1, 0, '2026-11-25T00:00:00Z')",
+                params![item_id],
+            )
+            .unwrap();
+        let claimed = post(
+            &cfg,
+            "/v1/jobs/j_impl/claim",
+            json!({"role": "implement", "adapter": "fake", "worker_id": "fake:impl"}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let claimed: Value = serde_json::from_slice(&claimed.body).unwrap();
+        let token = claimed["claim_token"].as_str().unwrap().to_string();
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET lease_until = '2000-01-01T00:00:00Z' WHERE id = 'j_impl'",
+                [],
+            )
+            .unwrap();
+
+        let adapter = claim::FakeAdapter {
+            socket_path: cfg.socket_path.clone(),
+            pause: Duration::from_millis(250),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            adapter.heartbeat(crate::state::Role::Implement, "j_impl", &token)
+        });
+        started_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(40));
+        let status_at = std::time::Instant::now();
+        let status = api(&cfg, "GET", "/v1/status", None);
+        assert_eq!(status.status, 200);
+        assert!(
+            status_at.elapsed() < Duration::from_millis(200),
+            "status blocked for {:?}",
+            status_at.elapsed()
+        );
+        let path = handle.join().unwrap().unwrap();
+        assert_eq!(path, "/v1/jobs/j_impl/heartbeat");
+        let lease: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT lease_until FROM jobs WHERE id = 'j_impl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(lease, "2000-01-01T00:00:00Z");
+        let item_lease: Option<String> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT lease_until FROM items WHERE id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(item_lease.is_none());
+
+        let released = post_cli(&cfg, "/v1/jobs/j_impl/release", json!({}));
+        assert_eq!(
+            released.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&released.body)
+        );
+        let released: Value = serde_json::from_slice(&released.body).unwrap();
+        assert_eq!(released["state"], "queued");
+
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET state = 'ready_for_review', implementer_worker = 'fake:impl'
+                 WHERE id = 'j_impl'",
+                [],
+            )
+            .unwrap();
+        let review = post(
+            &cfg,
+            "/v1/jobs/j_impl/claim",
+            json!({"role": "review", "adapter": "fake", "worker_id": "fake:rev"}),
+        );
+        assert_eq!(
+            review.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&review.body)
+        );
+        let review: Value = serde_json::from_slice(&review.body).unwrap();
+        let token = review["claim_token"].as_str().unwrap().to_string();
+        let adapter = claim::FakeAdapter {
+            socket_path: cfg.socket_path.clone(),
+            pause: Duration::ZERO,
+        };
+        let path = adapter
+            .heartbeat(crate::state::Role::Review, "j_impl", &token)
+            .unwrap();
+        assert_eq!(path, "/v1/jobs/j_impl/heartbeat");
+        let released = post_cli(&cfg, "/v1/jobs/j_impl/release", json!({}));
+        assert_eq!(
+            released.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&released.body)
+        );
+        let same = post(
+            &cfg,
+            "/v1/jobs/j_impl/claim",
+            json!({"role": "review", "worker_id": "fake:impl"}),
+        );
+        assert_eq!(same.status, 409, "{}", String::from_utf8_lossy(&same.body));
+        assert!(String::from_utf8_lossy(&same.body).contains("implementer"));
+        drop(running);
+    }
+
+    #[test]
+    fn resolve_asks_for_the_full_id_when_a_prefix_matches_both() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        // The socket is bound before the schema commit. Wait until the accept loop.
+        assert_eq!(api(&cfg, "GET", "/v1/status", None).status, 200);
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO items (id, title, body, source, state, created_at, updated_at)
+                 VALUES ('ab_item', 't', 'b', 'cli', 'inbox', '2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, item_id, title, state, depth, ord, updated_at)
+                 VALUES ('ab_job', 'ab_item', 't', 'queued', 1, 0, '2026-11-25T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let both = api(&cfg, "GET", "/v1/resolve?id=ab", None);
+        assert_eq!(both.status, 409, "{}", String::from_utf8_lossy(&both.body));
+        assert!(String::from_utf8_lossy(&both.body).contains("full id"));
+        let item = api(&cfg, "GET", "/v1/resolve?id=ab_item", None);
+        assert_eq!(item.status, 200);
+        let item: Value = serde_json::from_slice(&item.body).unwrap();
+        assert_eq!(item["kind"], "item");
+        assert_eq!(item["id"], "ab_item");
+        let job = api(&cfg, "GET", "/v1/resolve?id=ab_job", None);
+        let job: Value = serde_json::from_slice(&job.body).unwrap();
+        assert_eq!(job["kind"], "job");
+        let missing = api(&cfg, "GET", "/v1/resolve?id=nope", None);
+        assert_eq!(missing.status, 404);
         drop(running);
     }
 

@@ -75,6 +75,9 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
             print!("{}", render_status(&status));
             Ok(())
         }
+        Some("claim") => claim_cmd(config, &args[1..]),
+        Some("heartbeat") => heartbeat_cmd(config, &args[1..]),
+        Some("release") => release_cmd(config, &args[1..]),
         Some(other) => {
             eprintln!("{}", usage());
             Err(Error::Invalid(format!("unknown command {other}")))
@@ -92,7 +95,10 @@ usage:
   keel list [--state STATE]
   keel show ID
   keel url ID
-  keel open ID"
+  keel open ID
+  keel claim ID --role plan|revise|implement|review
+  keel heartbeat ID --token TOKEN
+  keel release ID [--force]"
 }
 
 fn no_args(cmd: &str, args: &[String]) -> Result<()> {
@@ -207,6 +213,191 @@ fn read_stdin_body() -> Result<String> {
     String::from_utf8(buf).map_err(|_| Error::Invalid("body is not utf-8".into()))
 }
 
+fn claim_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut role = None;
+    let mut adapter = None;
+    let mut worker = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--role" | "--adapter" | "--worker" => {
+                let flag = arg;
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| Error::Invalid(format!("missing value for {flag}")))?;
+                match flag {
+                    "--role" => role = Some(value.clone()),
+                    "--adapter" => adapter = Some(value.clone()),
+                    _ => worker = Some(value.clone()),
+                }
+            }
+            s if s.starts_with("--role=") => role = Some(s["--role=".len()..].to_string()),
+            s if s.starts_with("--adapter=") => adapter = Some(s["--adapter=".len()..].to_string()),
+            s if s.starts_with("--worker=") => worker = Some(s["--worker=".len()..].to_string()),
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    let role = role.ok_or_else(|| Error::Invalid("missing --role".into()))?;
+    let role = crate::claim::parse_role(&role)?;
+    let resolved = resolve(config, &id)?;
+    let kind = resolved["kind"].as_str().unwrap_or("");
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let matches_kind = matches!(
+        (role, kind),
+        (
+            crate::state::Role::Plan | crate::state::Role::Revise,
+            "item"
+        ) | (
+            crate::state::Role::Implement | crate::state::Role::Review,
+            "job"
+        )
+    );
+    if !matches_kind || full_id.is_empty() {
+        return Err(Error::Invalid(format!(
+            "role {} does not match {kind} {full_id}",
+            role.as_str()
+        )));
+    }
+    let path = match kind {
+        "item" => format!("/v1/items/{full_id}/claim"),
+        "job" => format!("/v1/jobs/{full_id}/claim"),
+        _ => return Err(Error::Invalid(format!("unknown kind {kind}"))),
+    };
+    let mut payload = json!({
+        "role": role.as_str(),
+        "adapter": adapter.unwrap_or_else(|| "cli".into()),
+    });
+    if let Some(worker) = worker {
+        payload["worker_id"] = json!(worker);
+    }
+    let claimed = daemon_json(
+        config,
+        "POST",
+        &path,
+        Some(payload.to_string().into_bytes()),
+    )?;
+    println!("{}", claimed["id"].as_str().unwrap_or(full_id));
+    println!("{}", claimed["claim_token"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+fn heartbeat_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut token = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--token" => {
+                i += 1;
+                token = Some(
+                    args.get(i)
+                        .ok_or_else(|| Error::Invalid("missing value for --token".into()))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--token=") => token = Some(s["--token=".len()..].to_string()),
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    let token = token.ok_or_else(|| Error::Invalid("missing --token".into()))?;
+    if token.is_empty() {
+        return Err(Error::Invalid("claim_token is empty".into()));
+    }
+    let resolved = resolve(config, &id)?;
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let path = match resolved["kind"].as_str() {
+        Some("item") => format!("/v1/items/{full_id}/heartbeat"),
+        Some("job") => format!("/v1/jobs/{full_id}/heartbeat"),
+        other => {
+            return Err(Error::Invalid(format!(
+                "unknown kind {}",
+                other.unwrap_or("")
+            )))
+        }
+    };
+    let body = json!({ "claim_token": token });
+    let beat = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!("{}", beat["lease_until"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+fn release_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--force" => force = true,
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    let resolved = resolve(config, &id)?;
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let path = match resolved["kind"].as_str() {
+        Some("item") => format!("/v1/items/{full_id}/release"),
+        Some("job") => format!("/v1/jobs/{full_id}/release"),
+        other => {
+            return Err(Error::Invalid(format!(
+                "unknown kind {}",
+                other.unwrap_or("")
+            )))
+        }
+    };
+    // The CLI omits the token. The socket still records a human cause, not expiry.
+    let body = json!({ "force": force });
+    let released = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!(
+        "{} {}",
+        released["id"].as_str().unwrap_or(full_id),
+        released["state"].as_str().unwrap_or("")
+    );
+    Ok(())
+}
+
+fn resolve(config: &Config, id: &str) -> Result<Value> {
+    if !crate::render::safe_id(id) {
+        return Err(Error::NotFound(id.to_string()));
+    }
+    daemon_json(
+        config,
+        "GET",
+        &format!("/v1/resolve?id={}", url_encode(id)),
+        None,
+    )
+}
+
 fn list(config: &Config, state: Option<&str>) -> Result<()> {
     let path = match state {
         Some(state) => format!("/v1/items?state={}", url_encode(state)),
@@ -228,7 +419,13 @@ fn daemon_json(config: &Config, method: &str, path: &str, body: Option<Vec<u8>>)
     let mut stream = connect(config)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let response = http::exchange(&mut stream, method, path, body.as_deref())?;
+    let response = http::exchange_with(
+        &mut stream,
+        method,
+        path,
+        body.as_deref(),
+        &[("x-keel-surface", "cli")],
+    )?;
     if !(200..300).contains(&response.status) {
         let message = String::from_utf8_lossy(&response.body);
         return Err(Error::Invalid(format!(
@@ -544,5 +741,64 @@ mod tests {
         assert!(status.contains("planning: 0\n"));
         assert!(status.contains("leases: 0/4\n"));
         assert!(status.contains("pid: 9\n"));
+    }
+
+    #[test]
+    fn claim_heartbeat_and_human_release_round_trip() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["add".into(), "Hold a lease".into()]).unwrap();
+        let id: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row("SELECT id FROM items", [], |row| row.get(0))
+            .unwrap();
+        let prefix = id.chars().take(6).collect::<String>();
+        dispatch(
+            &cfg,
+            &["claim".into(), prefix, "--role".into(), "plan".into()],
+        )
+        .unwrap();
+        let (state, pid, token): (String, Option<i64>, String) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state, claim_pid, claim_token FROM items WHERE id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "planning");
+        assert!(pid.is_none());
+        assert!(!token.is_empty());
+        dispatch(
+            &cfg,
+            &["heartbeat".into(), id.clone(), "--token".into(), token],
+        )
+        .unwrap();
+        dispatch(&cfg, &["release".into(), id.clone()]).unwrap();
+        let state: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "inbox");
+        let token: Option<String> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_token FROM items WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(token.is_none());
+        assert!(dispatch(&cfg, &["heartbeat".into(), id.clone()]).is_err());
+        assert!(dispatch(
+            &cfg,
+            &["claim".into(), id, "--role".into(), "implement".into()]
+        )
+        .is_err());
+        drop(running);
     }
 }
