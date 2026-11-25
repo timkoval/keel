@@ -76,6 +76,7 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("claim") => claim_cmd(config, &args[1..]),
+        Some("run") => run_cmd(config, &args[1..]),
         Some("heartbeat") => heartbeat_cmd(config, &args[1..]),
         Some("release") => release_cmd(config, &args[1..]),
         Some("note") => note_cmd(config, &args[1..]),
@@ -102,6 +103,7 @@ usage:
   keel url ID
   keel open ID
   keel claim ID --role plan|revise|implement|review
+  keel run ID --role plan|revise|implement|review [--adapter fake]
   keel heartbeat ID --token TOKEN
   keel release ID [--force]
   keel note ID TEXT
@@ -224,6 +226,73 @@ fn read_stdin_body() -> Result<String> {
 }
 
 fn claim_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let (id, role, adapter, worker) = parse_role_flags(args)?;
+    let role = crate::claim::parse_role(&role)?;
+    let resolved = resolve(config, &id)?;
+    let kind = resolved["kind"].as_str().unwrap_or("");
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let path = claim_path(role, kind, full_id)?;
+    let mut payload = json!({
+        "role": role.as_str(),
+        "adapter": adapter.unwrap_or_else(|| "cli".into()),
+    });
+    if let Some(worker) = worker {
+        payload["worker_id"] = json!(worker);
+    }
+    let claimed = daemon_json(
+        config,
+        "POST",
+        &path,
+        Some(payload.to_string().into_bytes()),
+    )?;
+    println!("{}", claimed["id"].as_str().unwrap_or(full_id));
+    println!("{}", claimed["claim_token"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+fn run_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let (id, role, adapter, worker) = parse_role_flags(args)?;
+    let adapter = adapter.unwrap_or_else(|| "fake".to_string());
+    // No model binary. The fake adapter only heartbeats on the socket.
+    if adapter != "fake" {
+        return Err(Error::Invalid(
+            "only the fake adapter is available; it does not spawn a model".into(),
+        ));
+    }
+    let role = crate::claim::parse_role(&role)?;
+    let resolved = resolve(config, &id)?;
+    let kind = resolved["kind"].as_str().unwrap_or("");
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let path = claim_path(role, kind, full_id)?;
+    let mut payload = json!({
+        "role": role.as_str(),
+        "adapter": adapter,
+    });
+    if let Some(worker) = worker {
+        payload["worker_id"] = json!(worker);
+    }
+    let claimed = daemon_json(
+        config,
+        "POST",
+        &path,
+        Some(payload.to_string().into_bytes()),
+    )?;
+    let token = claimed["claim_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Error::Invalid("claim_token is missing".into()))?;
+    let claimed_id = claimed["id"].as_str().unwrap_or(full_id);
+    let until = crate::claim::fake_heartbeat(&config.socket_path, role, claimed_id, token)?;
+    println!("{claimed_id}");
+    println!("{token}");
+    println!("{}", claimed["worktree"].as_str().unwrap_or("-"));
+    println!("{}", claimed["prompt_path"].as_str().unwrap_or(""));
+    println!("{}", claimed["snapshot"]["head"].as_str().unwrap_or("-"));
+    println!("{until}");
+    Ok(())
+}
+
+fn parse_role_flags(args: &[String]) -> Result<(String, String, Option<String>, Option<String>)> {
     let mut id = None;
     let mut role = None;
     let mut adapter = None;
@@ -261,10 +330,10 @@ fn claim_cmd(config: &Config, args: &[String]) -> Result<()> {
     }
     let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
     let role = role.ok_or_else(|| Error::Invalid("missing --role".into()))?;
-    let role = crate::claim::parse_role(&role)?;
-    let resolved = resolve(config, &id)?;
-    let kind = resolved["kind"].as_str().unwrap_or("");
-    let full_id = resolved["id"].as_str().unwrap_or("");
+    Ok((id, role, adapter, worker))
+}
+
+fn claim_path(role: crate::state::Role, kind: &str, full_id: &str) -> Result<String> {
     let matches_kind = matches!(
         (role, kind),
         (
@@ -281,27 +350,11 @@ fn claim_cmd(config: &Config, args: &[String]) -> Result<()> {
             role.as_str()
         )));
     }
-    let path = match kind {
-        "item" => format!("/v1/items/{full_id}/claim"),
-        "job" => format!("/v1/jobs/{full_id}/claim"),
-        _ => return Err(Error::Invalid(format!("unknown kind {kind}"))),
-    };
-    let mut payload = json!({
-        "role": role.as_str(),
-        "adapter": adapter.unwrap_or_else(|| "cli".into()),
-    });
-    if let Some(worker) = worker {
-        payload["worker_id"] = json!(worker);
+    match kind {
+        "item" => Ok(format!("/v1/items/{full_id}/claim")),
+        "job" => Ok(format!("/v1/jobs/{full_id}/claim")),
+        _ => Err(Error::Invalid(format!("unknown kind {kind}"))),
     }
-    let claimed = daemon_json(
-        config,
-        "POST",
-        &path,
-        Some(payload.to_string().into_bytes()),
-    )?;
-    println!("{}", claimed["id"].as_str().unwrap_or(full_id));
-    println!("{}", claimed["claim_token"].as_str().unwrap_or(""));
-    Ok(())
 }
 
 fn heartbeat_cmd(config: &Config, args: &[String]) -> Result<()> {
@@ -1028,12 +1081,14 @@ mod tests {
     fn note_submit_approve_and_drop_round_trip() {
         let _rm = Rm(scratch_dir());
         let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let repo = _rm.0.join("repo");
+        let head = crate::git::init_repo(&repo);
         dispatch(
             &cfg,
             &[
                 "add".into(),
                 "--repo".into(),
-                "/tmp/repo".into(),
+                repo.to_str().unwrap().into(),
                 "--branch".into(),
                 "main".into(),
                 "Pin the walk".into(),
@@ -1049,6 +1104,7 @@ mod tests {
             &["claim".into(), id.clone(), "--role".into(), "plan".into()],
         )
         .unwrap();
+        assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
         let token: String = open(&cfg.db_path)
             .unwrap()
             .query_row(
@@ -1171,6 +1227,73 @@ mod tests {
             )
             .unwrap();
         assert!(token.is_none());
+        drop(running);
+    }
+
+    #[test]
+    fn run_uses_the_fake_adapter_and_leaves_primary_head() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let repo = _rm.0.join("repo");
+        let head = crate::git::init_repo(&repo);
+        dispatch(
+            &cfg,
+            &[
+                "add".into(),
+                "--repo".into(),
+                repo.to_str().unwrap().into(),
+                "--branch".into(),
+                "main".into(),
+                "--body".into(),
+                "untrusted body".into(),
+                "Run it".into(),
+            ],
+        )
+        .unwrap();
+        let id: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row("SELECT id FROM items", [], |row| row.get(0))
+            .unwrap();
+        let refused = dispatch(
+            &cfg,
+            &[
+                "run".into(),
+                id.clone(),
+                "--role".into(),
+                "plan".into(),
+                "--adapter".into(),
+                "grok".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("fake"), "{refused}");
+        assert_eq!(state_of(&cfg, &id), "inbox");
+        dispatch(
+            &cfg,
+            &["run".into(), id.clone(), "--role".into(), "plan".into()],
+        )
+        .unwrap();
+        assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
+        assert_eq!(crate::git::snapshot(&repo).unwrap().branch, "main");
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        let worktree = cfg.data_dir.join("worktrees").join(&id).join("plan");
+        assert!(worktree.is_dir());
+        let tree = crate::git::snapshot(&worktree).unwrap();
+        assert_eq!(tree.head, head);
+        assert_eq!(tree.branch, "HEAD");
+        let prompt =
+            fs::read_to_string(cfg.data_dir.join("prompts").join(format!("{id}.txt"))).unwrap();
+        assert!(prompt.contains("untrusted body"));
+        assert!(prompt.contains("Do not edit the repo. Do not git checkout."));
+        let until: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT lease_until FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!until.is_empty());
         drop(running);
     }
 

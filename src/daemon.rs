@@ -296,7 +296,8 @@ fn mutate_response(
                 Ok(input) => input,
                 Err(err) => return fail(err),
             };
-            match claim::claim_and_prepare(&shared.db, target, id, &input) {
+            match claim::claim_and_prepare(&shared.db, target, id, &input, &shared.config.data_dir)
+            {
                 Ok(prepared) => Response::json(
                     200,
                     json!({
@@ -306,6 +307,10 @@ fn mutate_response(
                         "claim_token": prepared.claim.token,
                         "worker_id": prepared.claim.worker_id,
                         "lease_until": prepared.claim.lease_until,
+                        "worktree": prepared.worktree.as_ref().map(|path| path.display().to_string()),
+                        "prompt_path": prepared.prompt_path.display().to_string(),
+                        "diff_path": prepared.diff_path.as_ref().map(|path| path.display().to_string()),
+                        "snapshot": snapshot_json(prepared.snapshot.as_ref()),
                     }),
                 ),
                 Err(err) => fail(err),
@@ -412,6 +417,17 @@ fn method_not_allowed(allow: &str) -> Response {
 
 fn missing(id: &str) -> Response {
     http::error_response(404, &Error::NotFound(id.to_string()))
+}
+
+fn snapshot_json(snapshot: Option<&crate::git::PrimarySnapshot>) -> Value {
+    match snapshot {
+        None => Value::Null,
+        Some(snapshot) => json!({
+            "head": snapshot.head,
+            "branch": snapshot.branch,
+            "porcelain": snapshot.porcelain,
+        }),
+    }
 }
 
 fn fail(err: Error) -> Response {
@@ -1025,7 +1041,7 @@ fn submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
             Ok(conn) => conn,
             Err(err) => return fail(err),
         };
-        // There is no worktree until a later PR, so the detached tree is the clean fixture.
+        // Snapshot enforcement is a later submit. The claim already recorded one.
         let tree = state::DetachedWorktree::unchanged();
         let result = match read_item_state(&conn, id) {
             Ok(state_name) => match state_name.as_str() {
@@ -1878,8 +1894,11 @@ mod tests {
         );
         let claimed: Value = serde_json::from_slice(&claimed.body).unwrap();
         let token = claimed["claim_token"].as_str().unwrap().to_string();
-        assert!(claimed.get("worktree").is_none());
-        assert!(claimed.get("prompt_path").is_none());
+        // No repo, so plan does not create a worktree. The prompt is still written.
+        assert!(claimed["worktree"].is_null());
+        assert!(claimed["snapshot"].is_null());
+        let prompt_path = claimed["prompt_path"].as_str().unwrap();
+        assert!(Path::new(prompt_path).is_file());
         let pid: Option<i64> = open(&cfg.db_path)
             .unwrap()
             .query_row(
@@ -2047,19 +2066,23 @@ mod tests {
         let (cfg, running) = boot_at(&_rm.0).unwrap();
         let created = post_item(&cfg, "Implement", "body");
         let item_id = created["id"].as_str().unwrap().to_string();
+        let repo = _rm.0.join("repo");
+        let head = crate::git::init_repo(&repo);
+        let before = head.clone();
         open(&cfg.db_path)
             .unwrap()
             .execute(
-                "UPDATE items SET state = 'awaiting_implementation' WHERE id = ?1",
-                params![item_id],
+                "UPDATE items SET state = 'awaiting_implementation', repo = ?1, target_branch = 'main', base_sha = ?2
+                 WHERE id = ?3",
+                params![repo.to_str().unwrap(), head, item_id],
             )
             .unwrap();
         open(&cfg.db_path)
             .unwrap()
             .execute(
-                "INSERT INTO jobs (id, item_id, title, acceptance, state, depth, ord, updated_at)
-                 VALUES ('j_impl', ?1, 'Leaf', '', 'queued', 1, 0, '2026-11-25T00:00:00Z')",
-                params![item_id],
+                "INSERT INTO jobs (id, item_id, title, acceptance, state, depth, ord, base_sha, updated_at)
+                 VALUES ('j_impl', ?1, 'Leaf', '', 'queued', 1, 0, ?2, '2026-11-25T00:00:00Z')",
+                params![item_id, head],
             )
             .unwrap();
         let claimed = post(
@@ -2075,6 +2098,14 @@ mod tests {
         );
         let claimed: Value = serde_json::from_slice(&claimed.body).unwrap();
         let token = claimed["claim_token"].as_str().unwrap().to_string();
+        assert_eq!(claimed["snapshot"]["head"], before);
+        assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), before);
+        let worktree = claimed["worktree"].as_str().unwrap();
+        assert!(Path::new(worktree).is_dir());
+        assert!(claimed["prompt_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("j_impl.txt"));
         open(&cfg.db_path)
             .unwrap()
             .execute(
@@ -2265,6 +2296,9 @@ mod tests {
     fn note_waive_revise_approve_and_drop() {
         let _rm = Rm(scratch_dir());
         let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let repo = _rm.0.join("repo");
+        crate::git::init_repo(&repo);
+        let repo_s = repo.to_str().unwrap();
         let created = api(
             &cfg,
             "POST",
@@ -2274,7 +2308,7 @@ mod tests {
                     "source": "cli",
                     "title": "Pin <walk>",
                     "body": "body",
-                    "repo": "/tmp/repo",
+                    "repo": repo_s,
                     "target_branch": "main",
                 })
                 .to_string()
@@ -2692,7 +2726,7 @@ mod tests {
                     "source": "cli",
                     "title": "One leaf",
                     "body": "",
-                    "repo": "/tmp/repo",
+                    "repo": repo_s,
                     "target_branch": "main",
                 })
                 .to_string()
