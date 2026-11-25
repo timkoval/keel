@@ -718,6 +718,93 @@ pub fn heartbeat_item(conn: &mut Connection, item_id: &str, claim_token: &str) -
     })
 }
 
+/// Grok jobs store `ask`. There is no path that writes `always-approve`.
+pub fn set_job_permission_ask(
+    conn: &mut Connection,
+    job_id: &str,
+    claim_token: &str,
+) -> Result<()> {
+    with_tx(conn, |tx| {
+        let updated = tx.execute(
+            "UPDATE jobs SET permission_mode = 'ask' WHERE id = ?1 AND claim_token = ?2",
+            params![job_id, claim_token],
+        )?;
+        if updated != 1 {
+            let job = load_job(tx, job_id)?;
+            return Err(conflict(job.state, "permission mode was not recorded"));
+        }
+        Ok(())
+    })
+}
+
+/// The ACP task is blocked. The database mutex is not held while it waits.
+pub fn arm_job_permit(
+    conn: &mut Connection,
+    job_id: &str,
+    claim_token: &str,
+    pending: &str,
+) -> Result<()> {
+    if pending.len() > 64 * 1024 {
+        return Err(Error::Invalid("permit request is too large".into()));
+    }
+    with_tx(conn, |tx| {
+        let updated = tx.execute(
+            "UPDATE jobs SET blocked_reason = 'permission', pending_permit = ?1
+             WHERE id = ?2 AND claim_token = ?3",
+            params![pending, job_id, claim_token],
+        )?;
+        if updated != 1 {
+            let job = load_job(tx, job_id)?;
+            return Err(conflict(job.state, "permit was not armed"));
+        }
+        Ok(())
+    })
+}
+
+/// Human answer, stored on the row the waiter already armed. No claim token:
+/// `keel permit` is the CLI, and the token is not printed.
+pub fn write_permit_answer(conn: &mut Connection, job_id: &str, answer: &str) -> Result<()> {
+    if answer.len() > 64 * 1024 {
+        return Err(Error::Invalid("permit answer is too large".into()));
+    }
+    with_tx(conn, |tx| {
+        let updated = tx.execute(
+            "UPDATE jobs SET pending_permit = ?1
+             WHERE id = ?2 AND claim_token IS NOT NULL AND blocked_reason = 'permission'",
+            params![answer, job_id],
+        )?;
+        if updated != 1 {
+            let job = load_job(tx, job_id)?;
+            return Err(conflict(job.state, "no permission is waiting"));
+        }
+        Ok(())
+    })
+}
+
+pub fn read_permit_blob(conn: &Connection, job_id: &str) -> Result<Option<String>> {
+    let blob = conn
+        .query_row(
+            "SELECT pending_permit FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(blob.flatten())
+}
+
+pub fn clear_job_permit(conn: &mut Connection, job_id: &str, claim_token: &str) -> Result<()> {
+    with_tx(conn, |tx| {
+        tx.execute(
+            "UPDATE jobs SET
+                blocked_reason = CASE WHEN blocked_reason = 'permission' THEN NULL ELSE blocked_reason END,
+                pending_permit = NULL
+             WHERE id = ?1 AND claim_token = ?2",
+            params![job_id, claim_token],
+        )?;
+        Ok(())
+    })
+}
+
 pub fn heartbeat_job(conn: &mut Connection, job_id: &str, claim_token: &str) -> Result<()> {
     with_tx(conn, |tx| {
         let updated = tx.execute(
@@ -3415,6 +3502,48 @@ mod tests {
             )
             .unwrap();
         assert!(permit.is_none());
+    }
+
+    #[test]
+    fn permit_blob_is_armed_answered_and_cleared_without_a_secret_column() {
+        let mut conn = mem();
+        let (_id, job, claim) = to_implementing(&mut conn);
+        let pending = r#"{"phase":"waiting","kind":"permission","tool":"bash"}"#;
+        arm_job_permit(&mut conn, &job, &claim.token, pending).unwrap();
+        let (reason, blob): (String, String) = conn
+            .query_row(
+                "SELECT blocked_reason, pending_permit FROM jobs WHERE id = ?1",
+                params![job],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "permission");
+        assert_eq!(blob, pending);
+        let answer = r#"{"phase":"answered","result":{"outcome":{"outcome":"cancelled"}}}"#;
+        write_permit_answer(&mut conn, &job, answer).unwrap();
+        assert_eq!(
+            read_permit_blob(&conn, &job).unwrap().as_deref(),
+            Some(answer)
+        );
+        clear_job_permit(&mut conn, &job, &claim.token).unwrap();
+        let (reason, blob): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT blocked_reason, pending_permit FROM jobs WHERE id = ?1",
+                params![job],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(reason.is_none());
+        assert!(blob.is_none());
+        set_job_permission_ask(&mut conn, &job, &claim.token).unwrap();
+        let mode: String = conn
+            .query_row(
+                "SELECT permission_mode FROM jobs WHERE id = ?1",
+                params![job],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "ask");
     }
 
     #[test]

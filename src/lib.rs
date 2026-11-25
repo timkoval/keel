@@ -2,6 +2,7 @@
 //! The CLI talks to the daemon over a Unix socket. It does not open the database.
 //! The document port is GET-only.
 
+pub(crate) mod adapters;
 pub(crate) mod claim;
 pub mod cli;
 pub(crate) mod config;

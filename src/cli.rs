@@ -77,6 +77,7 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
         }
         Some("claim") => claim_cmd(config, &args[1..]),
         Some("run") => run_cmd(config, &args[1..]),
+        Some("permit") => permit_cmd(config, &args[1..]),
         Some("heartbeat") => heartbeat_cmd(config, &args[1..]),
         Some("release") => release_cmd(config, &args[1..]),
         Some("note") => note_cmd(config, &args[1..]),
@@ -103,7 +104,8 @@ usage:
   keel url ID
   keel open ID
   keel claim ID --role plan|revise|implement|review
-  keel run ID --role plan|revise|implement|review [--adapter fake]
+  keel run ID --role plan|revise|implement|review [--adapter fake|grok]
+  keel permit ID [--once|--deny|--always]
   keel heartbeat ID --token TOKEN
   keel release ID [--force]
   keel note ID TEXT
@@ -253,12 +255,13 @@ fn claim_cmd(config: &Config, args: &[String]) -> Result<()> {
 fn run_cmd(config: &Config, args: &[String]) -> Result<()> {
     let (id, role, adapter, worker) = parse_role_flags(args)?;
     let adapter = adapter.unwrap_or_else(|| "fake".to_string());
-    // No model binary. The fake adapter asks the daemon to spawn a test child
-    // in its own process group, then heartbeats once.
+    if adapter == "grok" {
+        return run_grok(config, id, role, worker);
+    }
+    // The fake adapter asks the daemon to spawn a test child in its own
+    // process group, then heartbeats once. It is not a model.
     if adapter != "fake" {
-        return Err(Error::Invalid(
-            "only the fake adapter is available; it does not spawn a model".into(),
-        ));
+        return Err(Error::Invalid("adapter must be fake or grok".into()));
     }
     let role = crate::claim::parse_role(&role)?;
     let resolved = resolve(config, &id)?;
@@ -292,6 +295,207 @@ fn run_cmd(config: &Config, args: &[String]) -> Result<()> {
     println!("{}", claimed["snapshot"]["head"].as_str().unwrap_or("-"));
     println!("{until}");
     Ok(())
+}
+
+fn run_grok(config: &Config, id: String, role: String, worker: Option<String>) -> Result<()> {
+    // Probe before the claim so a missing binary does not take a lease.
+    crate::adapters::grok::ensure_grok_on_path()?;
+    let role = crate::claim::parse_role(&role)?;
+    let resolved = resolve(config, &id)?;
+    let kind = resolved["kind"].as_str().unwrap_or("");
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let path = claim_path(role, kind, full_id)?;
+    let mut payload = json!({
+        "role": role.as_str(),
+        "adapter": "grok",
+    });
+    if let Some(worker) = worker {
+        payload["worker_id"] = json!(worker);
+    }
+    let claimed = daemon_json(
+        config,
+        "POST",
+        &path,
+        Some(payload.to_string().into_bytes()),
+    )?;
+    let token = claimed["claim_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Error::Invalid("claim_token is missing".into()))?;
+    let claimed_id = claimed["id"].as_str().unwrap_or(full_id).to_string();
+    let until = crate::claim::fake_heartbeat(&config.socket_path, role, &claimed_id, token)?;
+    println!("{claimed_id}");
+    println!("{token}");
+    println!("{}", claimed["worktree"].as_str().unwrap_or("-"));
+    println!("{}", claimed["prompt_path"].as_str().unwrap_or(""));
+    println!("{}", claimed["snapshot"]["head"].as_str().unwrap_or("-"));
+    println!("{until}");
+    if io::stdin().is_terminal() {
+        // This process is the permit prompt. It does not return while the
+        // claim is held, so a permission cannot sit unanswered on a tty.
+        permit_until_idle(config, &claimed_id)?;
+    } else {
+        eprintln!("no tty; if a tool asks, run `keel permit {claimed_id}`");
+    }
+    Ok(())
+}
+
+fn permit_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let (id, choice) = parse_permit(args)?;
+    let resolved = resolve(config, &id)?;
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let kind = resolved["kind"].as_str().unwrap_or("");
+    let lease = daemon_json(
+        config,
+        "GET",
+        &format!("/v1/lease/{}", url_encode(full_id)),
+        None,
+    )?;
+    if let Some(pending) = lease.get("pending_permit") {
+        if !pending.is_null() {
+            eprint_permit(pending);
+        }
+    }
+    let choice = match choice {
+        Some(choice) => choice,
+        None if io::stdin().is_terminal() => read_choice()?,
+        None => {
+            return Err(Error::Invalid(
+                "no tty; pass --once, --deny, or --always".into(),
+            ));
+        }
+    };
+    let path = match kind {
+        "item" => format!("/v1/items/{full_id}/permit"),
+        "job" => format!("/v1/jobs/{full_id}/permit"),
+        other => return Err(Error::Invalid(format!("unknown kind {}", other))),
+    };
+    let answered = daemon_json(
+        config,
+        "POST",
+        &path,
+        Some(json!({ "choice": choice }).to_string().into_bytes()),
+    )?;
+    println!("{}", answered["result"]);
+    Ok(())
+}
+
+fn permit_until_idle(config: &Config, id: &str) -> Result<()> {
+    let mut answered = String::new();
+    loop {
+        let lease = daemon_json(
+            config,
+            "GET",
+            &format!("/v1/lease/{}", url_encode(id)),
+            None,
+        )?;
+        if !lease
+            .get("claimed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if let Some(pending) = lease.get("pending_permit") {
+            if pending.get("phase").and_then(Value::as_str) == Some("waiting") {
+                let key = pending
+                    .get("request_id")
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                if answered != key {
+                    eprint_permit(pending);
+                    let choice = read_choice()?;
+                    let kind = lease.get("kind").and_then(Value::as_str).unwrap_or("job");
+                    let path = match kind {
+                        "item" => format!("/v1/items/{id}/permit"),
+                        _ => format!("/v1/jobs/{id}/permit"),
+                    };
+                    daemon_json(
+                        config,
+                        "POST",
+                        &path,
+                        Some(json!({ "choice": choice }).to_string().into_bytes()),
+                    )?;
+                    answered = key;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn parse_permit(args: &[String]) -> Result<(String, Option<String>)> {
+    let mut id = None;
+    let mut choice = None;
+    for arg in args {
+        match arg.as_str() {
+            "--once" | "--deny" | "--always" => {
+                if choice.is_some() {
+                    return Err(Error::Invalid("one permit choice".into()));
+                }
+                choice = Some(arg.clone());
+            }
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    Ok((id, choice))
+}
+
+fn read_choice() -> Result<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let choice = line.trim().to_string();
+    if choice.is_empty() {
+        return Err(Error::Invalid("missing permit choice".into()));
+    }
+    Ok(choice)
+}
+
+fn eprint_permit(pending: &Value) {
+    let kind = pending
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("permission");
+    let tool = pending
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    eprintln!("permit {kind}: {tool}");
+    if let Some(question) = pending.get("question").and_then(Value::as_str) {
+        if !question.is_empty() {
+            eprintln!("{question}");
+        }
+    }
+    if let Some(options) = pending.get("options").and_then(Value::as_array) {
+        for (index, opt) in options.iter().enumerate() {
+            let name = opt
+                .get("name")
+                .or_else(|| opt.get("label"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if kind == "question" {
+                eprintln!("  {}. {name}", index + 1);
+            } else {
+                let id = opt.get("optionId").and_then(Value::as_str).unwrap_or("");
+                let opt_kind = opt.get("kind").and_then(Value::as_str).unwrap_or("");
+                eprintln!("  {id}  {name}  [{opt_kind}]");
+            }
+        }
+    }
+    if kind == "question" {
+        eprintln!("digit or n:");
+    } else {
+        eprintln!("y / n / A:");
+    }
 }
 
 fn parse_role_flags(args: &[String]) -> Result<(String, String, Option<String>, Option<String>)> {
@@ -1281,20 +1485,30 @@ mod tests {
             .unwrap()
             .query_row("SELECT id FROM items", [], |row| row.get(0))
             .unwrap();
-        let refused = dispatch(
-            &cfg,
-            &[
-                "run".into(),
-                id.clone(),
-                "--role".into(),
-                "plan".into(),
-                "--adapter".into(),
-                "grok".into(),
-            ],
-        )
-        .unwrap_err();
-        assert!(refused.to_string().contains("fake"), "{refused}");
-        assert_eq!(state_of(&cfg, &id), "inbox");
+        let missing = crate::adapters::grok::ensure_grok("/no/such").unwrap_err();
+        assert!(
+            missing.to_string().contains("grok is not on PATH"),
+            "{missing}"
+        );
+        if crate::adapters::grok::ensure_grok(&std::env::var("PATH").unwrap_or_default()).is_err() {
+            let refused = dispatch(
+                &cfg,
+                &[
+                    "run".into(),
+                    id.clone(),
+                    "--role".into(),
+                    "plan".into(),
+                    "--adapter".into(),
+                    "grok".into(),
+                ],
+            )
+            .unwrap_err();
+            assert!(
+                refused.to_string().contains("grok is not on PATH"),
+                "{refused}"
+            );
+            assert_eq!(state_of(&cfg, &id), "inbox");
+        }
         dispatch(
             &cfg,
             &["run".into(), id.clone(), "--role".into(), "plan".into()],

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 
+use crate::adapters::grok;
 use crate::claim::{self, Target};
 use crate::config::Config;
 use crate::db::{open, Error, Result};
@@ -248,7 +249,7 @@ fn quiet(err: &Error) -> bool {
     }
 }
 
-fn route_unix(req: &Request, shared: &Shared) -> Response {
+fn route_unix(req: &Request, shared: &Arc<Shared>) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/v1/items") => create_response(shared, &req.body),
         ("GET", "/v1/items") => list_response(shared, http::query(&req.query, "state")),
@@ -258,6 +259,13 @@ fn route_unix(req: &Request, shared: &Shared) -> Response {
             Some((target, id, action)) => mutate_response(shared, req, target, id, action),
             None => missing(path),
         },
+        ("GET", path) if path.starts_with("/v1/lease/") => {
+            let id = &path["/v1/lease/".len()..];
+            if id.is_empty() || id.contains('/') || !render::safe_id(id) {
+                return missing(id);
+            }
+            lease_response(shared, id)
+        }
         ("GET", path) if path.starts_with("/v1/items/") => {
             let id = &path["/v1/items/".len()..];
             if id.contains('/') || !render::safe_id(id) {
@@ -287,7 +295,15 @@ fn action_route(path: &str) -> Option<(Target, &str, &str)> {
     }
     if !matches!(
         action,
-        "claim" | "heartbeat" | "release" | "note" | "waive" | "approve" | "drop" | "submit"
+        "claim"
+            | "heartbeat"
+            | "release"
+            | "note"
+            | "waive"
+            | "approve"
+            | "drop"
+            | "submit"
+            | "permit"
     ) {
         return None;
     }
@@ -295,7 +311,7 @@ fn action_route(path: &str) -> Option<(Target, &str, &str)> {
 }
 
 fn mutate_response(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     req: &Request,
     target: Target,
     id: &str,
@@ -315,10 +331,35 @@ fn mutate_response(
             if spawn && input.pid.is_some() {
                 return fail(Error::Invalid("external claim is not spawned".into()));
             }
+            let grok_job = input.adapter.as_deref() == Some("grok");
+            if grok_job {
+                if let Err(err) = grok::ensure_grok_on_path() {
+                    return fail(err);
+                }
+            }
             match claim::claim_and_prepare(&shared.db, target, id, &input, &shared.config.data_dir)
             {
                 Ok(prepared) => {
-                    if spawn {
+                    if grok_job {
+                        let launch = grok::Launch {
+                            target: prepared.target,
+                            id: prepared.id.clone(),
+                            role: prepared.claim.role,
+                            token: prepared.claim.token.clone(),
+                            worktree: prepared.worktree.clone(),
+                            prompt_path: prepared.prompt_path.clone(),
+                        };
+                        let shared = Arc::clone(shared);
+                        thread::spawn(move || {
+                            let expected = launch
+                                .worktree
+                                .as_ref()
+                                .and_then(|path| crate::git::rev_parse(path, "HEAD").ok());
+                            let result =
+                                grok::execute(&shared.db, &shared.config.data_dir, &launch);
+                            finish_grok(&shared, &launch, expected.as_deref(), result);
+                        });
+                    } else if spawn {
                         if let Err(failure) = spawn_and_attach(
                             shared,
                             &prepared.id,
@@ -398,6 +439,7 @@ fn mutate_response(
             drop_response(shared, id, req, surface_cli)
         }),
         "submit" => item_action(target, action, || submit_response(shared, id, req)),
+        "permit" => permit_response(shared, target, id, req, surface_cli),
         _ => missing(action),
     }
 }
@@ -503,6 +545,282 @@ pub(crate) fn abandon_failed_spawn(
         let _ = claim::release(db, target, id, state::Release::human(), data_dir);
     }
     failure.error
+}
+
+fn permit_response(
+    shared: &Shared,
+    target: Target,
+    id: &str,
+    req: &Request,
+    surface_cli: bool,
+) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let choice = match required_string(&obj, "choice") {
+        Ok(choice) if choice.trim().is_empty() => {
+            return fail(Error::Invalid("missing permit choice".into()));
+        }
+        Ok(choice) => choice,
+        Err(err) => return fail(err),
+    };
+    match grok::answer(&shared.db, target, id, &choice) {
+        Ok(result) => Response::json(200, json!({ "id": id, "result": result })),
+        Err(err) => fail(err),
+    }
+}
+
+fn lease_response(shared: &Shared, id: &str) -> Response {
+    let conn = match lock_db(&shared.db) {
+        Ok(conn) => conn,
+        Err(err) => return fail(err),
+    };
+    let resolved = match claim::resolve_id(&conn, id) {
+        Ok(resolved) => resolved,
+        Err(err) => return fail(err),
+    };
+    let mut body = match lease_row(&conn, resolved.target, &resolved.id) {
+        Ok(body) => body,
+        Err(err) => return fail(err),
+    };
+    drop(conn);
+    if let Some(pending) = grok::pending_public(&resolved.id) {
+        body["pending_permit"] = pending;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("claim_token");
+        object.remove("secret");
+    }
+    Response::json(200, body)
+}
+
+fn lease_row(conn: &Connection, target: Target, id: &str) -> Result<Value> {
+    match target {
+        Target::Job => conn
+            .query_row(
+                "SELECT state, blocked_reason, pending_permit, claim_token IS NOT NULL, claim_worker
+                 FROM jobs WHERE id = ?1",
+                params![id],
+                |row| {
+                    let pending = row.get::<_, Option<String>>(2)?;
+                    Ok(json!({
+                        "id": id,
+                        "kind": "job",
+                        "state": row.get::<_, String>(0)?,
+                        "blocked_reason": row.get::<_, Option<String>>(1)?,
+                        "pending_permit": parse_permit(&pending),
+                        "claimed": row.get::<_, i64>(3)? != 0,
+                        "worker_id": row.get::<_, Option<String>>(4)?,
+                    }))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(id.to_string())),
+        Target::Item => conn
+            .query_row(
+                "SELECT state, claim_token IS NOT NULL, claim_worker FROM items WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(json!({
+                        "id": id,
+                        "kind": "item",
+                        "state": row.get::<_, String>(0)?,
+                        "blocked_reason": Value::Null,
+                        "pending_permit": Value::Null,
+                        "claimed": row.get::<_, i64>(1)? != 0,
+                        "worker_id": row.get::<_, Option<String>>(2)?,
+                    }))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(id.to_string())),
+    }
+}
+
+fn parse_permit(blob: &Option<String>) -> Value {
+    blob.as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn finish_grok(
+    shared: &Shared,
+    launch: &grok::Launch,
+    expected_head: Option<&str>,
+    result: Result<grok::RunDone>,
+) {
+    let outcome = match result {
+        Ok(done) => apply_grok_outcome(shared, launch, expected_head, done.output.as_deref()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = outcome {
+        let _ = abandon_grok(shared, launch, &err.to_string());
+    }
+}
+
+fn apply_grok_outcome(
+    shared: &Shared,
+    launch: &grok::Launch,
+    expected_head: Option<&str>,
+    output: Option<&str>,
+) -> Result<()> {
+    match launch.role {
+        state::Role::Plan | state::Role::Revise => {
+            let document =
+                output.ok_or_else(|| Error::Invalid("grok did not write a result".into()))?;
+            let tree = match (launch.worktree.as_ref(), expected_head) {
+                (Some(path), Some(expected)) => detached_tree(path, expected)?,
+                _ => state::DetachedWorktree::unchanged(),
+            };
+            {
+                let mut conn = lock_db(&shared.db)?;
+                match launch.role {
+                    state::Role::Plan => {
+                        state::submit_plan(&mut conn, &launch.id, &launch.token, document, tree)?;
+                    }
+                    _ => {
+                        state::submit_revision(
+                            &mut conn,
+                            &launch.id,
+                            &launch.token,
+                            document,
+                            tree,
+                        )?;
+                    }
+                }
+            }
+            if let Err(err) = publish_plan(shared, &launch.id) {
+                note_log(
+                    &shared.config.data_dir,
+                    &launch.id,
+                    &format!("plan html: {err}"),
+                );
+            }
+            Ok(())
+        }
+        state::Role::Implement => {
+            let facts = implement_facts(shared, launch)?;
+            let mut conn = lock_db(&shared.db)?;
+            if facts.tree.clean && facts.tree.on_branch && !facts.tree.head_is_base {
+                state::submit_implement(
+                    &mut conn,
+                    &launch.id,
+                    &launch.token,
+                    &facts.head,
+                    facts.tree,
+                )?;
+            } else {
+                state::fail_implement(&mut conn, &launch.id, &launch.token, !facts.tree.clean)?;
+            }
+            Ok(())
+        }
+        state::Role::Review => {
+            let document =
+                output.ok_or_else(|| Error::Invalid("grok did not write a review".into()))?;
+            let expected = expected_head
+                .ok_or_else(|| Error::Invalid("review worktree head was not recorded".into()))?;
+            let path = launch
+                .worktree
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("review worktree is missing".into()))?;
+            let tree = detached_tree(path, expected)?;
+            let mut conn = lock_db(&shared.db)?;
+            state::submit_review(&mut conn, &launch.id, &launch.token, document, tree)?;
+            Ok(())
+        }
+    }
+}
+
+fn detached_tree(path: &Path, expected_head: &str) -> Result<state::DetachedWorktree> {
+    let snap = crate::git::snapshot(path)?;
+    Ok(state::DetachedWorktree {
+        clean: snap.porcelain.is_empty(),
+        head_unchanged: snap.head == expected_head,
+    })
+}
+
+struct ImplementFacts {
+    tree: state::ImplementWorktree,
+    head: String,
+}
+
+fn implement_facts(shared: &Shared, launch: &grok::Launch) -> Result<ImplementFacts> {
+    let (base, item_id, branch) = {
+        let conn = lock_db(&shared.db)?;
+        conn.query_row(
+            "SELECT j.base_sha, j.item_id, j.branch FROM jobs j WHERE j.id = ?1",
+            params![launch.id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?
+    };
+    let path = launch
+        .worktree
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("implement worktree is missing".into()))?;
+    let snap = crate::git::snapshot(path)?;
+    let branch = branch.unwrap_or_else(|| format!("keel/{item_id}/{}", launch.id));
+    let base = base.unwrap_or_default();
+    Ok(ImplementFacts {
+        head: snap.head.clone(),
+        tree: state::ImplementWorktree {
+            clean: snap.porcelain.is_empty(),
+            on_branch: snap.branch == branch,
+            head_is_base: snap.head == base,
+        },
+    })
+}
+
+fn abandon_grok(shared: &Shared, launch: &grok::Launch, reason: &str) -> Result<()> {
+    note_log(
+        &shared.config.data_dir,
+        &launch.id,
+        &format!("grok: {reason}"),
+    );
+    if launch.role == state::Role::Implement {
+        let dirty = launch
+            .worktree
+            .as_ref()
+            .and_then(|path| crate::git::snapshot(path).ok())
+            .map(|snap| !snap.porcelain.is_empty())
+            .unwrap_or(false);
+        let mut conn = lock_db(&shared.db)?;
+        if state::fail_implement(&mut conn, &launch.id, &launch.token, dirty).is_ok() {
+            return Ok(());
+        }
+    }
+    claim::release(
+        &shared.db,
+        launch.target,
+        &launch.id,
+        state::Release::human(),
+        &shared.config.data_dir,
+    )?;
+    Ok(())
+}
+
+fn note_log(data_dir: &Path, id: &str, line: &str) {
+    if !render::safe_id(id) {
+        return;
+    }
+    let path = data_dir.join("logs").join(format!("{id}.log"));
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b"\n");
+    }
 }
 
 fn snapshot_json(snapshot: Option<&crate::git::PrimarySnapshot>) -> Value {
