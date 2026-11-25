@@ -88,6 +88,12 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
         Some("accept") => accept_cmd(config, &args[1..]),
         Some("reject") => reject_cmd(config, &args[1..]),
         Some("merge") => merge_cmd(config, &args[1..]),
+        Some("mcp") => {
+            if args.len() != 1 {
+                return Err(Error::Invalid("mcp takes no arguments".into()));
+            }
+            crate::mcp::serve(config)
+        }
         Some(other) => {
             eprintln!("{}", usage());
             Err(Error::Invalid(format!("unknown command {other}")))
@@ -118,7 +124,8 @@ usage:
   keel drop ID [--force]
   keel accept ID
   keel reject ID TEXT
-  keel merge ID [--continue|--abort]"
+  keel merge ID [--continue|--abort]
+  keel mcp"
 }
 
 fn no_args(cmd: &str, args: &[String]) -> Result<()> {
@@ -1076,14 +1083,12 @@ fn daemon_json_timeout(
     body: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<Value> {
-    let mut stream = connect(config)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let response = http::exchange_with(
-        &mut stream,
+    let response = exchange_timeout(
+        config,
         method,
         path,
-        body.as_deref(),
+        body,
+        timeout,
         &[("x-keel-surface", "cli")],
     )?;
     if !(200..300).contains(&response.status) {
@@ -1094,6 +1099,31 @@ fn daemon_json_timeout(
         )));
     }
     serde_json::from_slice(&response.body).map_err(|err| Error::Invalid(format!("json: {err}")))
+}
+
+/// Socket call with no CLI surface header. MCP uses this so a tool cannot
+/// reach approve, merge, or the other routes that check `x-keel-surface`.
+pub(crate) fn daemon_exchange(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> Result<http::Response> {
+    exchange_timeout(config, method, path, body, Duration::from_secs(5), &[])
+}
+
+fn exchange_timeout(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    headers: &[(&str, &str)],
+) -> Result<http::Response> {
+    let mut stream = connect(config)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    http::exchange_with(&mut stream, method, path, body.as_deref(), headers)
 }
 
 fn connect(config: &Config) -> Result<UnixStream> {
