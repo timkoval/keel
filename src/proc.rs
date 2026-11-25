@@ -93,8 +93,8 @@ pub(crate) fn leader_reused(lease: &ProcLease) -> bool {
 }
 
 /// `true` when the caller may set `pid_gone`. External rows are never signaled.
-/// A spawned group is signaled unless the leader pid was reused. The bool is
-/// `kill(-pgid, 0) == ESRCH` for a spawned group, not merely "the leader exited".
+/// A reused leader is not this child: no SIGTERM, SIGKILL, or `kill(-pgid, 0)`.
+/// A group we still own is `true` only when `kill(-pgid, 0)` is `ESRCH`.
 pub(crate) fn prepare_gone(lease: &ProcLease) -> Result<bool> {
     let Some(pid) = lease.pid else {
         return Ok(false);
@@ -108,7 +108,7 @@ pub(crate) fn prepare_gone(lease: &ProcLease) -> Result<bool> {
         return Ok(false);
     };
     match leader(pid, lease.starttime.as_deref().unwrap_or("")) {
-        Leader::Reused => group_empty(pgid),
+        Leader::Reused => Ok(true),
         Leader::Same | Leader::Dead => {
             if !group_empty(pgid)? {
                 empty_group(pgid, pid)?;
@@ -120,11 +120,29 @@ pub(crate) fn prepare_gone(lease: &ProcLease) -> Result<bool> {
     }
 }
 
+/// Why a spawn did not finish attaching. `group_live` means a process group
+/// was created and `empty_group` did not see it become empty, so the caller
+/// must not return the row to the queue.
+#[derive(Debug)]
+pub(crate) struct SpawnFailure {
+    pub error: Error,
+    pub group_live: bool,
+}
+
+impl SpawnFailure {
+    fn idle(error: Error) -> Self {
+        Self {
+            error,
+            group_live: false,
+        }
+    }
+}
+
 /// Test child: leader pgid equals pid, grandchild writes `marker` and both sleep
 /// until the group is killed. Not an adapter and not a model binary.
-pub(crate) fn spawn_marker(marker: &Path) -> Result<Spawned> {
+pub(crate) fn spawn_marker(marker: &Path) -> std::result::Result<Spawned, SpawnFailure> {
     if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|err| SpawnFailure::idle(err.into()))?;
     }
     let _ = fs::remove_file(marker);
     // Non-interactive bash does not enable job control, so the background
@@ -147,7 +165,7 @@ exec sleep 300
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.process_group(0);
-    let child = cmd.spawn()?;
+    let child = cmd.spawn().map_err(|err| SpawnFailure::idle(err.into()))?;
     let pid = i64::from(child.id());
     // Dropping `Child` does not wait. The leader stays our child so a later
     // `waitpid` can collect the zombie; otherwise `kill(-pgid, 0)` never
@@ -167,12 +185,30 @@ exec sleep 300
             starttime,
         })
     })();
-    if let Err(err) = spawned {
-        let pgid = read_pgrp(pid as u32).unwrap_or(pid);
-        let _ = empty_group(pgid, pid);
-        return Err(err);
+    match spawned {
+        Ok(spawned) => Ok(spawned),
+        Err(err) => Err(kill_unless_empty(pid, err)),
     }
-    spawned
+}
+
+/// After the child exists, the row may be released only when this returns
+/// `group_live == false`. Any `empty_group` error means the group is still live.
+pub(crate) fn kill_unless_empty(pid: i64, error: Error) -> SpawnFailure {
+    let pgid = if pid > 0 && pid <= i64::from(u32::MAX) {
+        read_pgrp(pid as u32).unwrap_or(pid)
+    } else {
+        pid
+    };
+    match empty_group(pgid, pid) {
+        Ok(()) => SpawnFailure {
+            error,
+            group_live: false,
+        },
+        Err(kill_err) => SpawnFailure {
+            error: kill_err,
+            group_live: true,
+        },
+    }
 }
 
 pub(crate) fn group_empty(pgid: i64) -> Result<bool> {
@@ -307,7 +343,8 @@ mod tests {
     use crate::db::open_in_memory;
     use crate::state::{self, RawIntake, Release};
     use rusqlite::params;
-    use std::sync::Mutex;
+    use std::os::unix::process::CommandExt;
+    use std::sync::{Arc, Mutex};
 
     fn scratch() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -718,20 +755,393 @@ mod tests {
         assert_eq!(state_name, "implementing");
         assert!(still_running(spawned.pid));
         assert!(still_running(gpid));
-        let err = claim::release(
+        // Human release clears the row. The live group is not our child, so it
+        // stays in /proc and is not probed with kill(-pgid, 0).
+        let state_name = claim::release(
             &setup.db,
             Target::Job,
             "j_child",
             Release::human(),
             &setup.root,
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("reused") || err.to_string().contains("not signaled"),
-            "{err}"
-        );
+        .unwrap();
+        assert_eq!(state_name, "queued");
         assert!(still_running(spawned.pid));
         assert!(still_running(gpid));
         assert!(!group_empty(spawned.pgid).unwrap());
+    }
+
+    #[test]
+    fn reused_unrelated_group_leader_is_released_without_a_signal() {
+        let setup = claimed_job();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = cmd.spawn().unwrap();
+        let pid = i64::from(child.id());
+        let _keep = ChildHold(Some(child));
+        let pgid = read_pgrp(pid as u32).unwrap();
+        assert_eq!(pgid, pid);
+        assert!(still_running(pid));
+        setup
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET claim_pid = ?1, claim_pgid = ?1, claim_starttime = '1',
+                        lease_until = '2000-01-01T00:00:00Z'
+                 WHERE id = 'j_child'",
+                params![pid],
+            )
+            .unwrap();
+        claim::reap(&setup.db, &setup.root, true).unwrap();
+        let state_name: String = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT state FROM jobs WHERE id = 'j_child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_name, "implementing");
+        assert!(still_running(pid));
+        let state_name = claim::release(
+            &setup.db,
+            Target::Job,
+            "j_child",
+            Release::human(),
+            &setup.root,
+        )
+        .unwrap();
+        assert_eq!(state_name, "queued");
+        assert!(still_running(pid), "unrelated group leader left /proc");
+        assert!(!group_empty(pgid).unwrap());
+    }
+
+    #[test]
+    fn reap_rereads_before_signal_and_does_not_take_a_moved_row() {
+        let setup = claimed_job();
+        let marker = setup.worktree.join(GRANDCHILD_FILE);
+        let spawned = spawn_marker(&marker).unwrap();
+        let _guard = GroupGuard {
+            pgid: Some(spawned.pgid),
+            pid: Some(spawned.pid),
+        };
+        attach(&setup, &spawned);
+        assert!(wait_marker(&marker));
+        setup
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET lease_until = '2000-01-01T00:00:00Z' WHERE id = 'j_child'",
+                [],
+            )
+            .unwrap();
+        let slot = std::sync::Arc::new(Mutex::new(None::<std::process::Child>));
+        let hook_slot = std::sync::Arc::clone(&slot);
+        let _clear = ClearHook;
+        claim::set_reap_before_read(Some(Box::new(move |conn| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("300")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let child = cmd.spawn().unwrap();
+            let pid = i64::from(child.id());
+            *hook_slot.lock().unwrap() = Some(child);
+            let start = crate::daemon::read_proc_starttime(pid as u32).unwrap();
+            conn.execute(
+                "UPDATE jobs SET claim_pid = ?1, claim_pgid = ?1, claim_starttime = ?2,
+                        lease_until = '2099-01-01T00:00:00Z'
+                 WHERE id = 'j_child'",
+                params![pid, start],
+            )
+            .unwrap();
+        })));
+        let _slot_guard = SlotGuard(Arc::clone(&slot));
+        claim::reap(&setup.db, &setup.root, false).unwrap();
+        let (state_name, claim_pid): (String, i64) = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state, claim_pid FROM jobs WHERE id = 'j_child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state_name, "implementing");
+        let sleeper_pid = i64::from(slot.lock().unwrap().as_ref().unwrap().id());
+        assert_eq!(claim_pid, sleeper_pid);
+        assert!(
+            still_running(spawned.pid),
+            "stale reap killed the old group"
+        );
+        assert!(
+            still_running(sleeper_pid),
+            "stale reap killed the new group"
+        );
+    }
+
+    #[test]
+    fn reap_does_not_kill_a_lease_renewed_after_the_snapshot() {
+        let setup = claimed_job();
+        let marker = setup.worktree.join(GRANDCHILD_FILE);
+        let spawned = spawn_marker(&marker).unwrap();
+        let _guard = GroupGuard {
+            pgid: Some(spawned.pgid),
+            pid: Some(spawned.pid),
+        };
+        attach(&setup, &spawned);
+        assert!(wait_marker(&marker));
+        let gpid: i64 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        setup
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET lease_until = '2000-01-01T00:00:00Z' WHERE id = 'j_child'",
+                [],
+            )
+            .unwrap();
+        let _clear = ClearHook;
+        claim::set_reap_before_read(Some(Box::new(|conn| {
+            conn.execute(
+                "UPDATE jobs SET lease_until = '2099-01-01T00:00:00Z' WHERE id = 'j_child'",
+                [],
+            )
+            .unwrap();
+        })));
+        claim::reap(&setup.db, &setup.root, false).unwrap();
+        let state_name: String = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT state FROM jobs WHERE id = 'j_child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_name, "implementing");
+        assert!(still_running(spawned.pid));
+        assert!(still_running(gpid));
+    }
+
+    #[test]
+    fn kill_unless_empty_keeps_a_refused_group_and_reports_a_dead_one() {
+        let refused = kill_unless_empty(1, Error::Invalid("attach failed".into()));
+        assert!(refused.group_live);
+        assert!(
+            refused.error.to_string().contains("process group")
+                || refused.error.to_string().contains("refusing"),
+            "{}",
+            refused.error
+        );
+
+        let marker = scratch().join(GRANDCHILD_FILE);
+        let spawned = spawn_marker(&marker).unwrap();
+        let _guard = GroupGuard {
+            pgid: Some(spawned.pgid),
+            pid: Some(spawned.pid),
+        };
+        let cleared = kill_unless_empty(spawned.pid, Error::Invalid("attach failed".into()));
+        assert!(!cleared.group_live);
+        assert!(
+            cleared.error.to_string().contains("attach failed"),
+            "{}",
+            cleared.error
+        );
+        assert!(proc_state(spawned.pid).is_none());
+    }
+
+    #[test]
+    fn live_group_after_attach_failure_is_not_released() {
+        let setup = claimed_job();
+        let marker = setup.worktree.join(GRANDCHILD_FILE);
+        let spawned = spawn_marker(&marker).unwrap();
+        let _guard = GroupGuard {
+            pgid: Some(spawned.pgid),
+            pid: Some(spawned.pid),
+        };
+        let err = crate::daemon::abandon_failed_spawn(
+            &setup.db,
+            Target::Job,
+            "j_child",
+            &setup.root,
+            SpawnFailure {
+                error: Error::Invalid("attach failed".into()),
+                group_live: true,
+            },
+        );
+        assert!(err.to_string().contains("attach failed"), "{err}");
+        let state_name: String = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT state FROM jobs WHERE id = 'j_child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_name, "implementing");
+        assert!(still_running(spawned.pid));
+        assert!(!group_empty(spawned.pgid).unwrap());
+
+        let released = crate::daemon::abandon_failed_spawn(
+            &setup.db,
+            Target::Job,
+            "j_child",
+            &setup.root,
+            SpawnFailure {
+                error: Error::Invalid("never started".into()),
+                group_live: false,
+            },
+        );
+        assert!(released.to_string().contains("never started"), "{released}");
+        let state_name: String = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT state FROM jobs WHERE id = 'j_child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_name, "queued");
+        assert!(still_running(spawned.pid));
+    }
+
+    #[test]
+    fn empty_spawned_groups_signals_ours_and_spares_external_and_reused() {
+        let setup = claimed_job();
+        let marker = setup.worktree.join(GRANDCHILD_FILE);
+        let spawned = spawn_marker(&marker).unwrap();
+        let _guard = GroupGuard {
+            pgid: Some(spawned.pgid),
+            pid: Some(spawned.pid),
+        };
+        attach(&setup, &spawned);
+        assert!(wait_marker(&marker));
+        let gpid: i64 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+
+        let mut ext = Command::new("sleep");
+        ext.arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let ext_child = ext.spawn().unwrap();
+        let ext_pid = i64::from(ext_child.id());
+        let _ext = ChildHold(Some(ext_child));
+        let ext_start = crate::daemon::read_proc_starttime(ext_pid as u32).unwrap();
+
+        let mut reused = Command::new("sleep");
+        reused
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let reused_child = reused.spawn().unwrap();
+        let reused_pid = i64::from(reused_child.id());
+        let _reused = ChildHold(Some(reused_child));
+        assert_eq!(read_pgrp(reused_pid as u32), Some(reused_pid));
+
+        {
+            let conn = setup.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (
+                    id, item_id, title, acceptance, state, depth, ord, base_sha, updated_at,
+                    claim_token, claim_external, claim_pid, claim_starttime
+                 ) VALUES (
+                    'j_ext', ?1, 'Ext', '', 'implementing', 1, 1, 'abc', '2026-11-25T00:00:00Z',
+                    'tok-ext', 1, ?2, ?3
+                 )",
+                params![setup.item, ext_pid, ext_start],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (
+                    id, item_id, title, acceptance, state, depth, ord, base_sha, updated_at,
+                    claim_token, claim_external, claim_pid, claim_pgid, claim_starttime
+                 ) VALUES (
+                    'j_reused', ?1, 'Reused', '', 'implementing', 1, 2, 'abc', '2026-11-25T00:00:00Z',
+                    'tok-re', 0, ?2, ?2, '1'
+                 )",
+                params![setup.item, reused_pid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (
+                    id, item_id, title, acceptance, state, depth, ord, base_sha, updated_at,
+                    claim_token, claim_external
+                 ) VALUES (
+                    'j_null', ?1, 'Null', '', 'implementing', 1, 3, 'abc', '2026-11-25T00:00:00Z',
+                    'tok-null', 0
+                 )",
+                params![setup.item],
+            )
+            .unwrap();
+        }
+
+        claim::empty_spawned_groups(&setup.db, &setup.item).unwrap();
+        assert!(
+            proc_state(spawned.pid).is_none(),
+            "spawned leader still live"
+        );
+        assert!(proc_state(gpid).is_none(), "grandchild still live");
+        assert!(group_empty(spawned.pgid).unwrap());
+        assert!(still_running(ext_pid), "external pid was signaled");
+        assert!(still_running(reused_pid), "reused pid was signaled");
+        assert!(!group_empty(reused_pid).unwrap());
+
+        {
+            let mut conn = setup.db.lock().unwrap();
+            state::drop_item(&mut conn, &setup.item, true).unwrap();
+        }
+        let state_name: String = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                params![setup.item],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_name, "dropped");
+        assert!(still_running(ext_pid));
+        assert!(still_running(reused_pid));
+    }
+
+    struct ChildHold(Option<std::process::Child>);
+
+    impl Drop for ChildHold {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    struct ClearHook;
+
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            claim::set_reap_before_read(None);
+        }
+    }
+
+    struct SlotGuard(Arc<Mutex<Option<std::process::Child>>>);
+
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }

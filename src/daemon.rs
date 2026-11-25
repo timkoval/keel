@@ -319,20 +319,19 @@ fn mutate_response(
             {
                 Ok(prepared) => {
                     if spawn {
-                        if let Err(err) = spawn_and_attach(
+                        if let Err(failure) = spawn_and_attach(
                             shared,
                             &prepared.id,
                             &prepared.claim.token,
                             prepared.worktree.as_deref(),
                         ) {
-                            let _ = claim::release(
+                            return fail(abandon_failed_spawn(
                                 &shared.db,
                                 target,
                                 id,
-                                state::Release::human(),
                                 &shared.config.data_dir,
-                            );
-                            return fail(err);
+                                failure,
+                            ));
                         }
                     }
                     Response::json(
@@ -457,7 +456,12 @@ fn missing(id: &str) -> Response {
     http::error_response(404, &Error::NotFound(id.to_string()))
 }
 
-fn spawn_and_attach(shared: &Shared, id: &str, token: &str, worktree: Option<&Path>) -> Result<()> {
+fn spawn_and_attach(
+    shared: &Shared,
+    id: &str,
+    token: &str,
+    worktree: Option<&Path>,
+) -> std::result::Result<(), proc::SpawnFailure> {
     let marker = match worktree {
         Some(path) => path.join(proc::GRANDCHILD_FILE),
         None => shared
@@ -470,10 +474,7 @@ fn spawn_and_attach(shared: &Shared, id: &str, token: &str, worktree: Option<&Pa
     let spawned = proc::spawn_marker(&marker)?;
     let mut conn = match lock_db(&shared.db) {
         Ok(conn) => conn,
-        Err(err) => {
-            let _ = proc::empty_group(spawned.pgid, spawned.pid);
-            return Err(err);
-        }
+        Err(err) => return Err(proc::kill_unless_empty(spawned.pid, err)),
     };
     if let Err(err) = state::attach_process(
         &mut conn,
@@ -484,10 +485,24 @@ fn spawn_and_attach(shared: &Shared, id: &str, token: &str, worktree: Option<&Pa
         &spawned.starttime,
     ) {
         drop(conn);
-        let _ = proc::empty_group(spawned.pgid, spawned.pid);
-        return Err(err);
+        return Err(proc::kill_unless_empty(spawned.pid, err));
     }
     Ok(())
+}
+
+/// A live group stays leased. The row goes back to the queue only when the
+/// group was never created or `empty_group` already saw it empty.
+pub(crate) fn abandon_failed_spawn(
+    db: &Mutex<Connection>,
+    target: Target,
+    id: &str,
+    data_dir: &Path,
+    failure: proc::SpawnFailure,
+) -> Error {
+    if !failure.group_live {
+        let _ = claim::release(db, target, id, state::Release::human(), data_dir);
+    }
+    failure.error
 }
 
 fn snapshot_json(snapshot: Option<&crate::git::PrimarySnapshot>) -> Value {
@@ -1070,11 +1085,17 @@ fn drop_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) ->
         Ok(obj) => obj,
         Err(err) => return fail(err),
     };
-    // `--force` is only the state-machine flag. This slice has no child to signal.
     let force = match optional_bool(&obj, "force") {
         Ok(force) => force,
         Err(err) => return fail(err),
     };
+    // Non-force drops that will 409 must not signal. External pids are skipped
+    // inside empty_spawned_groups. A null pid with no pgid is cleared as-is.
+    if force {
+        if let Err(err) = claim::empty_spawned_groups(&shared.db, id) {
+            return fail(err);
+        }
+    }
     let dropped = {
         let mut conn = match lock_db(&shared.db) {
             Ok(conn) => conn,
@@ -2943,6 +2964,198 @@ mod tests {
             json!({"text": "nope"}),
         );
         assert_eq!(job_note.status, 400);
+        drop(running);
+    }
+
+    #[test]
+    fn drop_force_signals_spawned_groups_and_spares_the_rest() {
+        use std::process::{Command, Stdio};
+
+        fn alive(pid: i64) -> bool {
+            let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            let Some(end) = text.rfind(')') else {
+                return false;
+            };
+            let state = text[end + 1..]
+                .split_whitespace()
+                .next()
+                .and_then(|state| state.chars().next());
+            matches!(state, Some('S') | Some('R') | Some('D'))
+        }
+
+        struct KillChild(Option<std::process::Child>);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+
+        let spawned = post_item(&cfg, "Spawned", "body");
+        let spawned_id = spawned["id"].as_str().unwrap().to_string();
+        let claimed = post(
+            &cfg,
+            &format!("/v1/items/{spawned_id}/claim"),
+            json!({"role": "plan", "adapter": "cli", "spawn": true}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let spawned_pid: i64 = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_pid FROM items WHERE id = ?1",
+                params![spawned_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let _spawned_guard = crate::proc::GroupGuard {
+            pgid: Some(spawned_pid),
+            pid: Some(spawned_pid),
+        };
+        assert!(alive(spawned_pid));
+        let refused = post_cli(
+            &cfg,
+            &format!("/v1/items/{spawned_id}/drop"),
+            json!({"force": false}),
+        );
+        assert_eq!(
+            refused.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert!(alive(spawned_pid), "non-force drop signaled the group");
+
+        let ext = post_item(&cfg, "External", "body");
+        let ext_id = ext["id"].as_str().unwrap().to_string();
+        let ext_child = Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ext_pid = i64::from(ext_child.id());
+        let _ext = KillChild(Some(ext_child));
+        let claimed = post(
+            &cfg,
+            &format!("/v1/items/{ext_id}/claim"),
+            json!({"role": "plan", "adapter": "mcp", "pid": ext_pid}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let dropped = post_cli(
+            &cfg,
+            &format!("/v1/items/{ext_id}/drop"),
+            json!({"force": true}),
+        );
+        assert_eq!(
+            dropped.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&dropped.body)
+        );
+        assert!(alive(ext_pid), "drop --force signaled an external pid");
+
+        let reused = post_item(&cfg, "Reused", "body");
+        let reused_id = reused["id"].as_str().unwrap().to_string();
+        let claimed = post(
+            &cfg,
+            &format!("/v1/items/{reused_id}/claim"),
+            json!({"role": "plan", "adapter": "cli", "spawn": true}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let reused_pid: i64 = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_pid FROM items WHERE id = ?1",
+                params![reused_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let _reused_guard = crate::proc::GroupGuard {
+            pgid: Some(reused_pid),
+            pid: Some(reused_pid),
+        };
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE items SET claim_starttime = '1' WHERE id = ?1",
+                params![reused_id],
+            )
+            .unwrap();
+        let dropped = post_cli(
+            &cfg,
+            &format!("/v1/items/{reused_id}/drop"),
+            json!({"force": true}),
+        );
+        assert_eq!(
+            dropped.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&dropped.body)
+        );
+        assert!(alive(reused_pid), "drop --force signaled a reused pid");
+
+        let bare = post_item(&cfg, "Null pid", "body");
+        let bare_id = bare["id"].as_str().unwrap().to_string();
+        let claimed = post(
+            &cfg,
+            &format!("/v1/items/{bare_id}/claim"),
+            json!({"role": "plan", "adapter": "cli"}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let dropped = post_cli(
+            &cfg,
+            &format!("/v1/items/{bare_id}/drop"),
+            json!({"force": true}),
+        );
+        assert_eq!(
+            dropped.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&dropped.body)
+        );
+        assert_eq!(item_state_of(&cfg, &bare_id), "dropped");
+
+        let dropped = post_cli(
+            &cfg,
+            &format!("/v1/items/{spawned_id}/drop"),
+            json!({"force": true}),
+        );
+        assert_eq!(
+            dropped.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&dropped.body)
+        );
+        assert_eq!(item_state_of(&cfg, &spawned_id), "dropped");
+        assert!(!alive(spawned_pid), "drop --force left the spawned group");
         drop(running);
     }
 

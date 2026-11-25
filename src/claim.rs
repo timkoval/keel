@@ -15,7 +15,7 @@ use crate::daemon;
 use crate::db::{Error, Result};
 use crate::git::{self, PrimarySnapshot};
 use crate::proc::{self, ProcLease};
-use crate::state::{self, Claim, ClaimSpec, Release, ReleaseCause, Role};
+use crate::state::{self, Claim, ClaimSpec, LeaseStamp, Release, ReleaseCause, Role};
 
 const PROMPT_MAX: usize = 64 * 1024;
 
@@ -166,41 +166,86 @@ pub fn heartbeat(db: &Mutex<Connection>, target: Target, id: &str, token: &str) 
     Ok(until)
 }
 
+/// How the row was chosen. Reap re-reads immediately before signaling and
+/// stamps that identity. Human and explicit expiry do not require the timer.
+#[derive(Clone, Copy)]
+enum ObserveMode {
+    Human,
+    ExplicitExpiry,
+    Startup,
+    Periodic,
+}
+
 pub fn release(
+    db: &Mutex<Connection>,
+    target: Target,
+    id: &str,
+    release: Release,
+    data_dir: &Path,
+) -> Result<String> {
+    let mode = if release.cause == ReleaseCause::Expiry {
+        ObserveMode::ExplicitExpiry
+    } else {
+        ObserveMode::Human
+    };
+    commit_release(db, target, id, release, data_dir, mode)
+}
+
+fn commit_release(
     db: &Mutex<Connection>,
     target: Target,
     id: &str,
     mut release: Release,
     data_dir: &Path,
+    mode: ObserveMode,
 ) -> Result<String> {
     let observed = {
         let conn = lock_db(db)?;
+        if matches!(mode, ObserveMode::Startup | ObserveMode::Periodic) {
+            // The id list is already stale. This runs before the read that
+            // decides whether to signal.
+            run_reap_hook(&conn);
+        }
         load_observed(&conn, target, id)?
     };
+    if matches!(mode, ObserveMode::Startup | ObserveMode::Periodic) {
+        let startup = matches!(mode, ObserveMode::Startup);
+        if !proc::should_expire(&observed.proc, startup, observed.expired) {
+            return Ok(observed.state);
+        }
+    }
     // Kill outside the mutex. The state function only records the transition
     // after the group is empty; it does not signal.
     let gone = match proc::prepare_gone(&observed.proc) {
         Ok(gone) => gone,
         Err(Error::Conflict { message, .. }) => {
             return Err(Error::Conflict {
-                state: observed.state,
+                state: observed.state.clone(),
                 message,
             });
         }
         Err(err) => return Err(err),
     };
     if !observed.proc.external && observed.proc.pgid.is_some() && !gone {
-        let message = if proc::leader_reused(&observed.proc) {
-            "leader pid was reused; not signaled"
-        } else {
-            "process group is not empty"
-        };
         return Err(Error::Conflict {
             state: observed.state,
-            message: message.into(),
+            message: "process group is not empty".into(),
         });
     }
     release.pid_gone = gone;
+    if matches!(
+        mode,
+        ObserveMode::ExplicitExpiry | ObserveMode::Startup | ObserveMode::Periodic
+    ) {
+        release.stamp = Some(LeaseStamp {
+            external: observed.proc.external,
+            pid: observed.proc.pid,
+            pgid: observed.proc.pgid,
+            starttime: observed.proc.starttime.clone(),
+            lease_until: observed.lease_until.clone(),
+            require_expired: matches!(mode, ObserveMode::Periodic),
+        });
+    }
     let mut conn = lock_db(db)?;
     // Read before the transition. It clears claim_role. Implement and review
     // checkouts stay: the next claim reuses them. Plan and revise are removed
@@ -220,22 +265,89 @@ pub fn release(
 
 /// Startup passes `startup` so a spawned group is killed even if the timer has
 /// not expired. A null pid is left leased. External pids are not signaled.
+/// The id list is not the signal decision: each row is read again first.
 pub fn reap(db: &Mutex<Connection>, data_dir: &Path, startup: bool) -> Result<()> {
     let rows = {
         let conn = lock_db(db)?;
-        load_reap_rows(&conn)?
+        load_reap_ids(&conn)?
+    };
+    let mode = if startup {
+        ObserveMode::Startup
+    } else {
+        ObserveMode::Periodic
     };
     for row in rows {
-        if !proc::should_expire(&row.proc, startup, row.expired) {
-            continue;
-        }
         // One stuck group must not stop the others. The row stays leased when
-        // the group does not become empty.
-        if let Err(_err) = release(db, row.target, &row.id, Release::expiry(true), data_dir) {
+        // the group does not become empty or the lease moved.
+        if let Err(_err) = commit_release(
+            db,
+            row.target,
+            &row.id,
+            Release::expiry(false),
+            data_dir,
+            mode,
+        ) {
             continue;
         }
     }
     Ok(())
+}
+
+/// Spawned leases for one item. External pids are not signaled. A reused
+/// leader is not waited on. A null pid with no pgid is left for the caller.
+pub fn empty_spawned_groups(db: &Mutex<Connection>, item_id: &str) -> Result<()> {
+    let rows = {
+        let conn = lock_db(db)?;
+        load_item_groups(&conn, item_id)?
+    };
+    for row in rows {
+        if row.proc.external || row.proc.pid.is_none() || row.proc.pgid.is_none() {
+            continue;
+        }
+        if proc::leader_reused(&row.proc) {
+            continue;
+        }
+        let gone = match proc::prepare_gone(&row.proc) {
+            Ok(gone) => gone,
+            Err(Error::Conflict { message, .. }) => {
+                return Err(Error::Conflict {
+                    state: row.state,
+                    message,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        if !gone {
+            return Err(Error::Conflict {
+                state: row.state,
+                message: "process group is not empty".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static REAP_BEFORE_READ: Mutex<Option<Box<dyn Fn(&Connection) + Send>>> = Mutex::new(None);
+
+/// Test seam. The closure runs under the db lock, after the reap id list is
+/// taken and before that row is read again. It must not lock `db` itself.
+#[cfg(test)]
+pub(crate) fn set_reap_before_read(hook: Option<Box<dyn Fn(&Connection) + Send>>) {
+    *REAP_BEFORE_READ.lock().unwrap() = hook;
+}
+
+fn run_reap_hook(conn: &Connection) {
+    #[cfg(test)]
+    {
+        if let Some(hook) = REAP_BEFORE_READ.lock().unwrap().take() {
+            hook(conn);
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = conn;
+    }
 }
 
 /// Dozens of ids. This is a primary-key filter, not a scan to upgrade, until
@@ -339,6 +451,7 @@ pub fn parse_release(body: &[u8], surface_cli: bool) -> Result<Release> {
             force: false,
             claim_token,
             pid_gone: false,
+            stamp: None,
         });
     }
     if claim_token.is_some() {
@@ -347,6 +460,7 @@ pub fn parse_release(body: &[u8], surface_cli: bool) -> Result<Release> {
             force,
             claim_token,
             pid_gone: false,
+            stamp: None,
         });
     }
     if surface_cli {
@@ -355,6 +469,7 @@ pub fn parse_release(body: &[u8], surface_cli: bool) -> Result<Release> {
             force,
             claim_token: None,
             pid_gone: false,
+            stamp: None,
         });
     }
     Err(Error::Invalid(
@@ -403,17 +518,25 @@ fn worker_id(input: &ClaimInput) -> Result<String> {
 
 struct Observed {
     state: String,
+    lease_until: Option<String>,
+    expired: bool,
     proc: ProcLease,
 }
 
 fn load_observed(conn: &Connection, target: Target, id: &str) -> Result<Observed> {
     let sql = match target {
         Target::Item => {
-            "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime
+            "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime, lease_until,
+                    CASE WHEN lease_until IS NOT NULL
+                              AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                         THEN 1 ELSE 0 END
              FROM items WHERE id = ?1"
         }
         Target::Job => {
-            "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime
+            "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime, lease_until,
+                    CASE WHEN lease_until IS NOT NULL
+                              AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                         THEN 1 ELSE 0 END
              FROM jobs WHERE id = ?1"
         }
     };
@@ -426,51 +549,64 @@ fn load_observed(conn: &Connection, target: Target, id: &str) -> Result<Observed
                 pgid: row.get(3)?,
                 starttime: row.get(4)?,
             },
+            lease_until: row.get(5)?,
+            expired: row.get::<_, i64>(6)? != 0,
         })
     })
     .optional()?
     .ok_or_else(|| Error::NotFound(id.to_string()))
 }
 
-struct ReapRow {
+struct ReapId {
     target: Target,
     id: String,
-    expired: bool,
-    proc: ProcLease,
 }
 
-fn load_reap_rows(conn: &Connection) -> Result<Vec<ReapRow>> {
+fn load_reap_ids(conn: &Connection) -> Result<Vec<ReapId>> {
     let mut stmt = conn.prepare(
-        "SELECT kind, id, claim_external, claim_pid, claim_pgid, claim_starttime, expired FROM (
-            SELECT 'item' AS kind, id, claim_external, claim_pid, claim_pgid, claim_starttime,
-                   CASE WHEN lease_until IS NOT NULL
-                             AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                        THEN 1 ELSE 0 END AS expired
-            FROM items WHERE claim_token IS NOT NULL
+        "SELECT kind, id FROM (
+            SELECT 'item' AS kind, id FROM items WHERE claim_token IS NOT NULL
             UNION ALL
-            SELECT 'job', id, claim_external, claim_pid, claim_pgid, claim_starttime,
-                   CASE WHEN lease_until IS NOT NULL
-                             AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                        THEN 1 ELSE 0 END
-            FROM jobs WHERE claim_token IS NOT NULL
+            SELECT 'job', id FROM jobs WHERE claim_token IS NOT NULL
         )",
     )?;
     let rows = stmt.query_map([], |row| {
         let kind: String = row.get(0)?;
-        Ok(ReapRow {
+        Ok(ReapId {
             target: if kind == "job" {
                 Target::Job
             } else {
                 Target::Item
             },
             id: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn load_item_groups(conn: &Connection, item_id: &str) -> Result<Vec<Observed>> {
+    let mut stmt = conn.prepare(
+        "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime, lease_until
+         FROM items WHERE id = ?1
+         UNION ALL
+         SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime, lease_until
+         FROM jobs WHERE item_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![item_id], |row| {
+        Ok(Observed {
+            state: row.get(0)?,
             proc: ProcLease {
-                external: row.get::<_, i64>(2)? != 0,
-                pid: row.get(3)?,
-                pgid: row.get(4)?,
-                starttime: row.get(5)?,
+                external: row.get::<_, i64>(1)? != 0,
+                pid: row.get(2)?,
+                pgid: row.get(3)?,
+                starttime: row.get(4)?,
             },
-            expired: row.get::<_, i64>(6)? != 0,
+            lease_until: row.get(5)?,
+            expired: false,
         })
     })?;
     let mut out = Vec::new();
@@ -746,6 +882,7 @@ fn undo_claim(conn: &mut Connection, target: Target, id: &str) -> Result<()> {
         force: true,
         claim_token: None,
         pid_gone: false,
+        stamp: None,
     };
     match target {
         Target::Item => state::release_item(conn, id, release),
@@ -1517,6 +1654,7 @@ mod tests {
                 force: true,
                 claim_token: None,
                 pid_gone: false,
+                stamp: None,
             },
             &root,
         )
@@ -1668,6 +1806,7 @@ mod tests {
                 force: true,
                 claim_token: None,
                 pid_gone: false,
+                stamp: None,
             },
             &root,
         )

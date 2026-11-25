@@ -160,6 +160,9 @@ pub struct Release {
     /// Caller observed the recorded pid is dead, or its starttime no longer matches.
     /// For a spawned child this is `kill(-pgid, 0) == ESRCH`.
     pub pid_gone: bool,
+    /// When set, the expiry UPDATE matches these columns in the same transaction.
+    /// A row that moved after the reaper decided is left leased.
+    pub stamp: Option<LeaseStamp>,
 }
 
 impl Release {
@@ -169,6 +172,7 @@ impl Release {
             force: false,
             claim_token: None,
             pid_gone: false,
+            stamp: None,
         }
     }
 
@@ -178,8 +182,22 @@ impl Release {
             force: false,
             claim_token: None,
             pid_gone,
+            stamp: None,
         }
     }
+}
+
+/// Identity the reaper observed immediately before signaling.
+/// The clear matches these values so a newer lease is not expired.
+#[derive(Clone, Debug)]
+pub struct LeaseStamp {
+    pub external: bool,
+    pub pid: Option<i64>,
+    pub pgid: Option<i64>,
+    pub starttime: Option<String>,
+    pub lease_until: Option<String>,
+    /// Periodic reap only. Startup and an explicit expiry do not require this.
+    pub require_expired: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,7 +573,14 @@ pub fn release_item(conn: &mut Connection, item_id: &str, release: Release) -> R
             }
         };
         let now = sql_now(tx)?;
-        clear_item_claim(tx, item_id, next, &now, Some(held.token.as_str()))?;
+        clear_item_claim(
+            tx,
+            item_id,
+            next,
+            &now,
+            Some(held.token.as_str()),
+            release.stamp.as_ref(),
+        )?;
         event(
             tx,
             &now,
@@ -592,7 +617,14 @@ pub fn release_job(conn: &mut Connection, job_id: &str, release: Release) -> Res
             }
         };
         let now = sql_now(tx)?;
-        clear_job_claim(tx, job_id, next, &now, Some(held.token.as_str()))?;
+        clear_job_claim(
+            tx,
+            job_id,
+            next,
+            &now,
+            Some(held.token.as_str()),
+            release.stamp.as_ref(),
+        )?;
         event(
             tx,
             &now,
@@ -1080,7 +1112,7 @@ pub fn fail_implement(
                 Some("dirty"),
             )?;
         } else {
-            clear_job_claim(tx, job_id, JobState::Queued, &now, Some(claim_token))?;
+            clear_job_claim(tx, job_id, JobState::Queued, &now, Some(claim_token), None)?;
             event(
                 tx,
                 &now,
@@ -1110,7 +1142,7 @@ pub fn retry_job(conn: &mut Connection, job_id: &str) -> Result<()> {
             ));
         }
         let now = sql_now(tx)?;
-        clear_job_claim(tx, job_id, JobState::Queued, &now, None)?;
+        clear_job_claim(tx, job_id, JobState::Queued, &now, None, None)?;
         event(
             tx,
             &now,
@@ -1263,7 +1295,7 @@ pub fn drop_item(conn: &mut Connection, item_id: &str, force: bool) -> Result<()
             if job.state == JobState::Cancelled {
                 continue;
             }
-            clear_job_claim(tx, &job.id, JobState::Cancelled, &now, None)?;
+            clear_job_claim(tx, &job.id, JobState::Cancelled, &now, None, None)?;
             event(
                 tx,
                 &now,
@@ -1276,7 +1308,7 @@ pub fn drop_item(conn: &mut Connection, item_id: &str, force: bool) -> Result<()
                 None,
             )?;
         }
-        clear_item_claim(tx, item_id, ItemState::Dropped, &now, None)?;
+        clear_item_claim(tx, item_id, ItemState::Dropped, &now, None, None)?;
         event(
             tx,
             &now,
@@ -1584,7 +1616,7 @@ fn promote_containers(tx: &Transaction, job_id: &str, now: &str) -> Result<()> {
         if parent_job.state != JobState::Queued {
             return Ok(());
         }
-        clear_job_claim(tx, &parent, JobState::Accepted, now, None)?;
+        clear_job_claim(tx, &parent, JobState::Accepted, now, None, None)?;
         event(
             tx,
             now,
@@ -1844,22 +1876,27 @@ fn clear_item_claim(
     state: ItemState,
     now: &str,
     token: Option<&str>,
+    stamp: Option<&LeaseStamp>,
 ) -> Result<()> {
-    let sql = if token.is_some() {
-        format!(
-            "UPDATE items SET state = ?1, updated_at = ?2, {CLEAR_CLAIM_COLS}
-             WHERE id = ?3 AND claim_token = ?4"
-        )
-    } else {
-        format!("UPDATE items SET state = ?1, updated_at = ?2, {CLEAR_CLAIM_COLS} WHERE id = ?3")
-    };
-    let updated = if let Some(token) = token {
-        tx.execute(&sql, params![state.as_str(), now, item_id, token])?
-    } else {
-        tx.execute(&sql, params![state.as_str(), now, item_id])?
-    };
+    let (sql, stamped) =
+        claim_clear_sql("items", CLEAR_CLAIM_COLS, token.is_some(), stamp.is_some());
+    let updated = exec_clear(
+        tx,
+        &sql,
+        state.as_str(),
+        now,
+        item_id,
+        token,
+        stamp,
+        stamped,
+    )?;
     if updated != 1 {
-        return Err(conflict(state, "stale or missing claim_token"));
+        let message = if stamp.is_some() {
+            "lease changed before expiry"
+        } else {
+            "stale or missing claim_token"
+        };
+        return Err(conflict(state, message));
     }
     Ok(())
 }
@@ -1870,24 +1907,83 @@ fn clear_job_claim(
     state: JobState,
     now: &str,
     token: Option<&str>,
+    stamp: Option<&LeaseStamp>,
 ) -> Result<()> {
-    let sql = if token.is_some() {
-        format!(
-            "UPDATE jobs SET state = ?1, updated_at = ?2, {CLEAR_JOB_LEASE_COLS}
-             WHERE id = ?3 AND claim_token = ?4"
-        )
-    } else {
-        format!("UPDATE jobs SET state = ?1, updated_at = ?2, {CLEAR_JOB_LEASE_COLS} WHERE id = ?3")
-    };
-    let updated = if let Some(token) = token {
-        tx.execute(&sql, params![state.as_str(), now, job_id, token])?
-    } else {
-        tx.execute(&sql, params![state.as_str(), now, job_id])?
-    };
+    let (sql, stamped) = claim_clear_sql(
+        "jobs",
+        CLEAR_JOB_LEASE_COLS,
+        token.is_some(),
+        stamp.is_some(),
+    );
+    let updated = exec_clear(tx, &sql, state.as_str(), now, job_id, token, stamp, stamped)?;
     if updated != 1 {
-        return Err(conflict(state, "stale or missing claim_token"));
+        let message = if stamp.is_some() {
+            "lease changed before expiry"
+        } else {
+            "stale or missing claim_token"
+        };
+        return Err(conflict(state, message));
     }
     Ok(())
+}
+
+/// `IS` so a null pid, pgid, starttime, or lease_until still matches.
+fn claim_clear_sql(table: &str, cols: &str, token: bool, stamp: bool) -> (String, bool) {
+    let mut sql = format!("UPDATE {table} SET state = ?1, updated_at = ?2, {cols} WHERE id = ?3");
+    if token {
+        sql.push_str(" AND claim_token = ?4");
+    }
+    if stamp {
+        sql.push_str(
+            " AND claim_external = ?5
+              AND claim_pid IS ?6
+              AND claim_pgid IS ?7
+              AND claim_starttime IS ?8
+              AND lease_until IS ?9
+              AND (?10 = 0 OR (
+                    lease_until IS NOT NULL
+                    AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+              ))",
+        );
+    }
+    (sql, stamp)
+}
+
+fn exec_clear(
+    tx: &Transaction,
+    sql: &str,
+    state: &str,
+    now: &str,
+    id: &str,
+    token: Option<&str>,
+    stamp: Option<&LeaseStamp>,
+    stamped: bool,
+) -> Result<usize> {
+    let updated = match (token, stamp.filter(|_| stamped)) {
+        (Some(token), Some(stamp)) => tx.execute(
+            sql,
+            params![
+                state,
+                now,
+                id,
+                token,
+                if stamp.external { 1 } else { 0 },
+                stamp.pid,
+                stamp.pgid,
+                stamp.starttime,
+                stamp.lease_until,
+                if stamp.require_expired { 1 } else { 0 },
+            ],
+        )?,
+        (Some(token), None) => tx.execute(sql, params![state, now, id, token])?,
+        (None, None) => tx.execute(sql, params![state, now, id])?,
+        (None, Some(_)) => {
+            return Err(Error::Invalid(
+                "expiry stamp requires the claim token".into(),
+            ));
+        }
+    };
+    Ok(updated)
 }
 
 fn set_item_state(tx: &Transaction, item_id: &str, state: ItemState, now: &str) -> Result<()> {
@@ -2245,6 +2341,50 @@ mod tests {
         let (id, job) = to_approved(conn);
         let claim = claim_job(conn, &job, ClaimSpec::daemon("grok:impl", Role::Implement)).unwrap();
         (id, job, claim)
+    }
+
+    #[test]
+    fn expiry_stamp_rejects_a_moved_or_unexpired_lease() {
+        let mut conn = mem();
+        let (_id, job, claim) = to_implementing(&mut conn);
+        attach_process(&mut conn, &job, &claim.token, 50, 50, "start").unwrap();
+        let lease_until: String = conn
+            .query_row(
+                "SELECT lease_until FROM jobs WHERE id = ?1",
+                params![job],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stamp = |pid: i64, require_expired: bool| LeaseStamp {
+            external: false,
+            pid: Some(pid),
+            pgid: Some(pid),
+            starttime: Some("start".into()),
+            lease_until: Some(lease_until.clone()),
+            require_expired,
+        };
+        let mut moved = Release::expiry(true);
+        moved.stamp = Some(stamp(99, false));
+        let err = release_job(&mut conn, &job, moved).unwrap_err();
+        assert!(
+            err.to_string().contains("lease changed before expiry"),
+            "{err}"
+        );
+        assert_eq!(job_state(&mut conn, &job), "implementing");
+
+        let mut unexpired = Release::expiry(true);
+        unexpired.stamp = Some(stamp(50, true));
+        let err = release_job(&mut conn, &job, unexpired).unwrap_err();
+        assert!(
+            err.to_string().contains("lease changed before expiry"),
+            "{err}"
+        );
+        assert_eq!(job_state(&mut conn, &job), "implementing");
+
+        let mut matched = Release::expiry(true);
+        matched.stamp = Some(stamp(50, false));
+        release_job(&mut conn, &job, matched).unwrap();
+        assert_eq!(job_state(&mut conn, &job), "queued");
     }
 
     fn to_ready(conn: &mut Connection) -> (String, String) {
