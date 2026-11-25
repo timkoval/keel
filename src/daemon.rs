@@ -254,6 +254,8 @@ fn route_unix(req: &Request, shared: &Arc<Shared>) -> Response {
         ("POST", "/v1/items") => create_response(shared, &req.body),
         ("GET", "/v1/items") => list_response(shared, http::query(&req.query, "state")),
         ("GET", "/v1/status") => status_response(shared),
+        ("GET", "/v1/queues/plan-review") => queue_json_response(shared, QueueKind::Plan),
+        ("GET", "/v1/queues/feedback") => queue_json_response(shared, QueueKind::Feedback),
         ("GET", "/v1/resolve") => resolve_response(shared, http::query(&req.query, "id")),
         ("POST", path) => match action_route(path) {
             Some((target, id, action)) => mutate_response(shared, req, target, id, action),
@@ -478,7 +480,10 @@ fn mutate_response(
         "drop" => item_action(target, action, || {
             drop_response(shared, id, req, surface_cli)
         }),
-        "submit" => item_action(target, action, || submit_response(shared, id, req)),
+        "submit" => match target {
+            Target::Item => submit_response(shared, id, req),
+            Target::Job => job_submit_response(shared, id, req),
+        },
         "permit" => permit_response(shared, target, id, req, surface_cli),
         "accept" => job_action(target, action, || accept_response(shared, id, surface_cli)),
         "reject" => job_action(target, action, || {
@@ -1195,6 +1200,39 @@ fn queue_response(shared: &Shared, kind: QueueKind) -> Response {
     Response::html(render::queue_page(&view))
 }
 
+/// Same rows as the HTML queue. MCP reads this instead of scraping the document port.
+fn queue_json_response(shared: &Shared, kind: QueueKind) -> Response {
+    let conn = match lock_db(&shared.db) {
+        Ok(conn) => conn,
+        Err(err) => return fail(err),
+    };
+    match load_queue(&conn, &shared.config, kind) {
+        Ok(view) => {
+            let rows: Vec<Value> = view
+                .rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "id": row.id,
+                        "title": row.title,
+                        "summary": row.summary,
+                        "url": row.url,
+                    })
+                })
+                .collect();
+            Response::json(
+                200,
+                json!({
+                    "queue": view.name,
+                    "heading": view.heading,
+                    "rows": rows,
+                }),
+            )
+        }
+        Err(err) => fail(err),
+    }
+}
+
 fn publish_card(shared: &Shared, id: &str) -> Result<()> {
     if !render::safe_id(id) {
         return Err(Error::NotFound(id.to_string()));
@@ -1716,6 +1754,153 @@ fn submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
         ),
         Err(err) => fail(err),
     }
+}
+
+/// Job submit stays on the socket. Git facts are read here so an MCP client
+/// cannot declare the tree clean or choose `diff_ref`.
+fn job_submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let token = match required_string(&obj, "claim_token") {
+        Ok(token) if token.is_empty() => {
+            return fail(Error::Invalid("claim_token is empty".into()));
+        }
+        Ok(token) => token,
+        Err(err) => return fail(err),
+    };
+    let row = {
+        let conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match load_job_submit(&conn, id) {
+            Ok(row) => row,
+            Err(err) => return fail(err),
+        }
+    };
+    let submitted = match row.role.as_str() {
+        "implement" => submit_held_implement(&shared.db, id, &token, &row),
+        "review" => {
+            let Some(document_value) = obj.get("document") else {
+                return fail(Error::Invalid("document is required".into()));
+            };
+            let document = match document_text(document_value) {
+                Ok(document) => document,
+                Err(err) => return fail(err),
+            };
+            submit_held_review(&shared.db, id, &token, &document, &row)
+        }
+        _ => {
+            return fail(Error::Invalid(
+                "job submit requires an implement or review claim".into(),
+            ))
+        }
+    };
+    match submitted {
+        Ok(()) => {
+            let conn = match lock_db(&shared.db) {
+                Ok(conn) => conn,
+                Err(err) => return fail(err),
+            };
+            match job_view(&conn, id) {
+                Ok((job_state, item_id, item_state)) => Response::json(
+                    200,
+                    json!({
+                        "id": id,
+                        "kind": "job",
+                        "state": job_state,
+                        "item_id": item_id,
+                        "item_state": item_state,
+                    }),
+                ),
+                Err(err) => fail(err),
+            }
+        }
+        Err(err) => fail(err),
+    }
+}
+
+struct JobSubmitRow {
+    role: String,
+    worktree: PathBuf,
+    base_sha: String,
+    branch: String,
+}
+
+fn load_job_submit(conn: &Connection, id: &str) -> Result<JobSubmitRow> {
+    let row = conn
+        .query_row(
+            "SELECT claim_role, worktree, base_sha, item_id, branch FROM jobs WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((role, worktree, base, item_id, branch)) = row else {
+        return Err(Error::NotFound(id.to_string()));
+    };
+    let role = role.ok_or_else(|| Error::Conflict {
+        state: "unclaimed".into(),
+        message: "job is not claimed".into(),
+    })?;
+    let worktree = worktree
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| Error::Invalid("worktree is missing".into()))?;
+    let base_sha = base
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| Error::Invalid("base_sha is unset".into()))?;
+    let branch = branch
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("keel/{item_id}/{id}"));
+    Ok(JobSubmitRow {
+        role,
+        worktree: PathBuf::from(worktree),
+        base_sha,
+        branch,
+    })
+}
+
+fn submit_held_implement(
+    db: &Mutex<Connection>,
+    id: &str,
+    token: &str,
+    row: &JobSubmitRow,
+) -> Result<()> {
+    // Git stays outside the writer mutex. The client does not supply the sha.
+    let snap = crate::git::snapshot(&row.worktree)?;
+    let tree = state::ImplementWorktree {
+        clean: snap.porcelain.is_empty(),
+        on_branch: snap.branch == row.branch,
+        head_is_base: snap.head == row.base_sha,
+    };
+    let mut conn = lock_db(db)?;
+    state::submit_implement(&mut conn, id, token, &snap.head, tree)
+}
+
+fn submit_held_review(
+    db: &Mutex<Connection>,
+    id: &str,
+    token: &str,
+    document: &str,
+    row: &JobSubmitRow,
+) -> Result<()> {
+    let snap = crate::git::snapshot(&row.worktree)?;
+    let tree = state::DetachedWorktree {
+        clean: snap.porcelain.is_empty(),
+        // Review checkouts are detached at base_sha. A moved HEAD is not this claim.
+        head_unchanged: snap.head == row.base_sha,
+    };
+    let mut conn = lock_db(db)?;
+    state::submit_review(&mut conn, id, token, document, tree)
 }
 
 fn finish_plan(shared: &Shared, id: &str, mut body: Value) -> Response {

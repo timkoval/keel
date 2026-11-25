@@ -10,6 +10,7 @@ pub(crate) mod daemon;
 pub mod db;
 pub(crate) mod git;
 pub(crate) mod http;
+pub(crate) mod mcp;
 pub(crate) mod proc;
 pub(crate) mod render;
 pub mod state;
