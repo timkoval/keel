@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 
-use crate::adapters::grok;
+use crate::adapters::{claude, grok};
 use crate::claim::{self, Target};
 use crate::config::Config;
 use crate::db::{open, Error, Result};
@@ -332,8 +332,14 @@ fn mutate_response(
                 return fail(Error::Invalid("external claim is not spawned".into()));
             }
             let grok_job = input.adapter.as_deref() == Some("grok");
+            let claude_job = input.adapter.as_deref() == Some("claude");
             if grok_job {
                 if let Err(err) = grok::ensure_grok_on_path() {
+                    return fail(err);
+                }
+            }
+            if claude_job {
+                if let Err(err) = claude::ensure_claude_on_path() {
                     return fail(err);
                 }
             }
@@ -355,9 +361,40 @@ fn mutate_response(
                                 .worktree
                                 .as_ref()
                                 .and_then(|path| crate::git::rev_parse(path, "HEAD").ok());
+                            let held = WorkerLaunch::from_grok(&launch);
                             let result =
                                 grok::execute(&shared.db, &shared.config.data_dir, &launch);
-                            finish_grok(&shared, &launch, expected.as_deref(), result);
+                            finish_worker(
+                                &shared,
+                                &held,
+                                expected.as_deref(),
+                                result.map(|done| done.output),
+                            );
+                        });
+                    } else if claude_job {
+                        let launch = claude::Launch {
+                            target: prepared.target,
+                            id: prepared.id.clone(),
+                            role: prepared.claim.role,
+                            token: prepared.claim.token.clone(),
+                            worktree: prepared.worktree.clone(),
+                            prompt_path: prepared.prompt_path.clone(),
+                        };
+                        let shared = Arc::clone(shared);
+                        thread::spawn(move || {
+                            let expected = launch
+                                .worktree
+                                .as_ref()
+                                .and_then(|path| crate::git::rev_parse(path, "HEAD").ok());
+                            let held = WorkerLaunch::from_claude(&launch);
+                            let result =
+                                claude::execute(&shared.db, &shared.config.data_dir, &launch);
+                            finish_worker(
+                                &shared,
+                                &held,
+                                expected.as_deref(),
+                                result.map(|done| done.output),
+                            );
                         });
                     } else if spawn {
                         if let Err(failure) = spawn_and_attach(
@@ -647,14 +684,47 @@ fn parse_permit(blob: &Option<String>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn finish_grok(
+struct WorkerLaunch {
+    adapter: &'static str,
+    target: Target,
+    id: String,
+    role: state::Role,
+    token: String,
+    worktree: Option<PathBuf>,
+}
+
+impl WorkerLaunch {
+    fn from_grok(launch: &grok::Launch) -> Self {
+        Self {
+            adapter: "grok",
+            target: launch.target,
+            id: launch.id.clone(),
+            role: launch.role,
+            token: launch.token.clone(),
+            worktree: launch.worktree.clone(),
+        }
+    }
+
+    fn from_claude(launch: &claude::Launch) -> Self {
+        Self {
+            adapter: "claude",
+            target: launch.target,
+            id: launch.id.clone(),
+            role: launch.role,
+            token: launch.token.clone(),
+            worktree: launch.worktree.clone(),
+        }
+    }
+}
+
+fn finish_worker(
     shared: &Shared,
-    launch: &grok::Launch,
+    launch: &WorkerLaunch,
     expected_head: Option<&str>,
-    result: Result<grok::RunDone>,
+    result: Result<Option<String>>,
 ) {
     let outcome = match result {
-        Ok(done) => apply_grok_outcome(shared, launch, expected_head, done.output.as_deref()),
+        Ok(output) => apply_outcome(shared, launch, expected_head, output.as_deref()),
         Err(err) => Err(err),
     };
     if let Err(err) = outcome {
@@ -664,24 +734,25 @@ fn finish_grok(
             note_log(
                 &shared.config.data_dir,
                 &launch.id,
-                "grok process group is still live; lease kept",
+                &format!("{} process group is still live; lease kept", launch.adapter),
             );
             return;
         }
-        let _ = abandon_grok(shared, launch, &err.to_string());
+        let _ = abandon_worker(shared, launch, &err.to_string());
     }
 }
 
-fn apply_grok_outcome(
+fn apply_outcome(
     shared: &Shared,
-    launch: &grok::Launch,
+    launch: &WorkerLaunch,
     expected_head: Option<&str>,
     output: Option<&str>,
 ) -> Result<()> {
     match launch.role {
         state::Role::Plan | state::Role::Revise => {
-            let document =
-                output.ok_or_else(|| Error::Invalid("grok did not write a result".into()))?;
+            let document = output.ok_or_else(|| {
+                Error::Invalid(format!("{} did not write a result", launch.adapter))
+            })?;
             let tree = match (launch.worktree.as_ref(), expected_head) {
                 (Some(path), Some(expected)) => detached_tree(path, expected)?,
                 _ => state::DetachedWorktree::unchanged(),
@@ -729,8 +800,9 @@ fn apply_grok_outcome(
             Ok(())
         }
         state::Role::Review => {
-            let document =
-                output.ok_or_else(|| Error::Invalid("grok did not write a review".into()))?;
+            let document = output.ok_or_else(|| {
+                Error::Invalid(format!("{} did not write a review", launch.adapter))
+            })?;
             let expected = expected_head
                 .ok_or_else(|| Error::Invalid("review worktree head was not recorded".into()))?;
             let path = launch
@@ -758,7 +830,7 @@ struct ImplementFacts {
     head: String,
 }
 
-fn implement_facts(shared: &Shared, launch: &grok::Launch) -> Result<ImplementFacts> {
+fn implement_facts(shared: &Shared, launch: &WorkerLaunch) -> Result<ImplementFacts> {
     let (base, item_id, branch) = {
         let conn = lock_db(&shared.db)?;
         conn.query_row(
@@ -790,11 +862,11 @@ fn implement_facts(shared: &Shared, launch: &grok::Launch) -> Result<ImplementFa
     })
 }
 
-fn abandon_grok(shared: &Shared, launch: &grok::Launch, reason: &str) -> Result<()> {
+fn abandon_worker(shared: &Shared, launch: &WorkerLaunch, reason: &str) -> Result<()> {
     note_log(
         &shared.config.data_dir,
         &launch.id,
-        &format!("grok: {reason}"),
+        &format!("{}: {reason}", launch.adapter),
     );
     if reason.contains("process group is not empty") {
         return Err(Error::Conflict {

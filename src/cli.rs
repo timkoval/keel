@@ -104,7 +104,7 @@ usage:
   keel url ID
   keel open ID
   keel claim ID --role plan|revise|implement|review
-  keel run ID --role plan|revise|implement|review [--adapter fake|grok]
+  keel run ID --role plan|revise|implement|review [--adapter fake|grok|claude]
   keel permit ID [--once|--deny|--always]
   keel heartbeat ID --token TOKEN
   keel release ID [--force]
@@ -258,10 +258,15 @@ fn run_cmd(config: &Config, args: &[String]) -> Result<()> {
     if adapter == "grok" {
         return run_grok(config, id, role, worker);
     }
+    if adapter == "claude" {
+        return run_claude(config, id, role, worker);
+    }
     // The fake adapter asks the daemon to spawn a test child in its own
     // process group, then heartbeats once. It is not a model.
     if adapter != "fake" {
-        return Err(Error::Invalid("adapter must be fake or grok".into()));
+        return Err(Error::Invalid(
+            "adapter must be fake, grok, or claude".into(),
+        ));
     }
     let role = crate::claim::parse_role(&role)?;
     let resolved = resolve(config, &id)?;
@@ -337,6 +342,43 @@ fn run_grok(config: &Config, id: String, role: String, worker: Option<String>) -
     } else {
         eprintln!("no tty; if a tool asks, run `keel permit {claimed_id}`");
     }
+    Ok(())
+}
+
+fn run_claude(config: &Config, id: String, role: String, worker: Option<String>) -> Result<()> {
+    // Probe before the claim so a missing binary does not take a lease.
+    crate::adapters::claude::ensure_claude_on_path()?;
+    let role = crate::claim::parse_role(&role)?;
+    let resolved = resolve(config, &id)?;
+    let kind = resolved["kind"].as_str().unwrap_or("");
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    let path = claim_path(role, kind, full_id)?;
+    let mut payload = json!({
+        "role": role.as_str(),
+        "adapter": "claude",
+    });
+    if let Some(worker) = worker {
+        payload["worker_id"] = json!(worker);
+    }
+    let claimed = daemon_json(
+        config,
+        "POST",
+        &path,
+        Some(payload.to_string().into_bytes()),
+    )?;
+    let token = claimed["claim_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Error::Invalid("claim_token is missing".into()))?;
+    let claimed_id = claimed["id"].as_str().unwrap_or(full_id);
+    // The adapter heartbeats while the child is alive. A CLI heartbeat here
+    // races a short claude that has already submitted and cleared the token.
+    println!("{claimed_id}");
+    println!("{token}");
+    println!("{}", claimed["worktree"].as_str().unwrap_or("-"));
+    println!("{}", claimed["prompt_path"].as_str().unwrap_or(""));
+    println!("{}", claimed["snapshot"]["head"].as_str().unwrap_or("-"));
+    println!("{}", claimed["lease_until"].as_str().unwrap_or(""));
     Ok(())
 }
 

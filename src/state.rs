@@ -764,10 +764,24 @@ pub fn set_job_permission_ask(
     job_id: &str,
     claim_token: &str,
 ) -> Result<()> {
+    set_job_permission_mode(conn, job_id, claim_token, "ask")
+}
+
+/// Claude implement stores `auto` (or the item override). Review leaves that
+/// value so a later review page still shows how the implementer was gated.
+pub fn set_job_permission_mode(
+    conn: &mut Connection,
+    job_id: &str,
+    claim_token: &str,
+    mode: &str,
+) -> Result<()> {
+    if !matches!(mode, "ask" | "plan" | "acceptEdits" | "auto") {
+        return Err(Error::Invalid(format!("refusing permission_mode {mode}")));
+    }
     with_tx(conn, |tx| {
         let updated = tx.execute(
-            "UPDATE jobs SET permission_mode = 'ask' WHERE id = ?1 AND claim_token = ?2",
-            params![job_id, claim_token],
+            "UPDATE jobs SET permission_mode = ?1 WHERE id = ?2 AND claim_token = ?3",
+            params![mode, job_id, claim_token],
         )?;
         if updated != 1 {
             let job = load_job(tx, job_id)?;
