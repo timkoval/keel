@@ -725,7 +725,7 @@ fn lock_db(db: &Mutex<Connection>) -> Result<MutexGuard<'_, Connection>> {
         .map_err(|_| Error::Invalid("database lock poisoned".into()))
 }
 
-fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+pub(crate) fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     check_rev(ancestor)?;
     check_rev(descendant)?;
     let output = git_cmd(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
@@ -737,6 +737,29 @@ fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
             &output,
         )),
     }
+}
+
+/// First-parent merge commits reachable from `HEAD`, newest first.
+/// Read-only. Leaf merges live on the second parent, so they are not listed.
+pub(crate) fn first_parent_merges(repo: &Path) -> Result<Vec<(String, String)>> {
+    let text = git_text(
+        repo,
+        &["log", "--first-parent", "--merges", "--format=%H%x1f%s"],
+    )?;
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let Some((sha, subject)) = line.split_once('\u{1f}') else {
+            continue;
+        };
+        if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            out.push((sha.to_string(), subject.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 fn unmerged(repo: &Path) -> Result<bool> {

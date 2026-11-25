@@ -141,21 +141,50 @@ impl SpawnFailure {
 /// Test child: leader pgid equals pid, grandchild writes `marker` and both sleep
 /// until the group is killed. Not an adapter and not a model binary.
 pub(crate) fn spawn_marker(marker: &Path) -> std::result::Result<Spawned, SpawnFailure> {
-    if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent).map_err(|err| SpawnFailure::idle(err.into()))?;
-    }
-    let _ = fs::remove_file(marker);
     // Non-interactive bash does not enable job control, so the background
     // grandchild stays in the leader's group. `process_group(0)` makes that
     // group id the leader pid.
-    let script = r#"
+    spawn_script(
+        marker,
+        r#"
 marker=$1
 (
   echo "$BASHPID" > "$marker"
   exec sleep 300
 ) &
 exec sleep 300
-"#;
+"#,
+    )
+}
+
+/// Same group as [`spawn_marker`], but both bash processes ignore `SIGTERM`.
+/// `empty_group` still has to `SIGKILL` before the row can return to the queue.
+#[cfg(test)]
+fn spawn_ignore_term(marker: &Path) -> std::result::Result<Spawned, SpawnFailure> {
+    spawn_script(
+        marker,
+        r#"
+trap '' TERM
+marker=$1
+(
+  trap '' TERM
+  echo "$BASHPID" > "$marker"
+  while true; do
+    sleep 300
+  done
+) &
+while true; do
+  sleep 300
+done
+"#,
+    )
+}
+
+fn spawn_script(marker: &Path, script: &str) -> std::result::Result<Spawned, SpawnFailure> {
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent).map_err(|err| SpawnFailure::idle(err.into()))?;
+    }
+    let _ = fs::remove_file(marker);
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(script)
@@ -520,6 +549,50 @@ mod tests {
         assert!(proc_state(gpid).is_none(), "grandchild still in /proc");
         assert!(proc_state(spawned.pid).is_none(), "leader still in /proc");
         let _ = setup.item;
+    }
+
+    #[test]
+    fn ignored_sigterm_is_sigkilled_before_the_row_returns() {
+        let setup = claimed_job();
+        let marker = setup.worktree.join(GRANDCHILD_FILE);
+        let spawned = spawn_ignore_term(&marker).unwrap();
+        let _guard = GroupGuard {
+            pgid: Some(spawned.pgid),
+            pid: Some(spawned.pid),
+        };
+        attach(&setup, &spawned);
+        assert!(wait_marker(&marker), "grandchild did not write {marker:?}");
+        let gpid: i64 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        assert_ne!(gpid, spawned.pid);
+        assert_eq!(read_pgrp(gpid as u32), Some(spawned.pgid));
+        // The group is still ours after SIGTERM. Requeue before SIGKILL would
+        // leave this child in the worktree.
+        signal(spawned.pgid as i32, SIGTERM).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(still_running(spawned.pid), "leader exited on SIGTERM");
+        assert!(still_running(gpid), "grandchild exited on SIGTERM");
+        setup
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET lease_until = '2000-01-01T00:00:00Z' WHERE id = 'j_child'",
+                [],
+            )
+            .unwrap();
+        claim::reap(&setup.db, &setup.root, false).unwrap();
+        let state_name: String = setup
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT state FROM jobs WHERE id = 'j_child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_name, "queued");
+        assert!(group_empty(spawned.pgid).unwrap());
+        assert!(proc_state(gpid).is_none(), "grandchild still in /proc");
+        assert!(proc_state(spawned.pid).is_none(), "leader still in /proc");
     }
 
     #[test]

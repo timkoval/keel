@@ -133,6 +133,71 @@ pub fn plan_page(plan: &PlanView) -> String {
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct ReviewView {
+    pub item_id: String,
+    pub job_id: String,
+    pub title: String,
+    pub state: String,
+    pub summary: String,
+    pub rev: i64,
+    pub updated_at: String,
+    pub verdict: String,
+    pub base: String,
+    pub head: String,
+    pub stat: String,
+}
+
+/// Current review document. Doctor re-renders this when `review_json` is set
+/// and the canonical file is gone. It is not a second published JSON file.
+pub fn review_page(review: &ReviewView) -> String {
+    let verdict = if review.verdict.is_empty() {
+        Value::Null
+    } else {
+        json!(review.verdict)
+    };
+    let doc = json!({
+        "keel": 1,
+        "kind": "review",
+        "item_id": review.item_id,
+        "job_id": review.job_id,
+        "rev": review.rev,
+        "state": review.state,
+        "title": review.title,
+        "updated_at": review.updated_at,
+        "summary": review.summary,
+        "open_points": [],
+        "jobs": [],
+        "diff": {
+            "base": review.base,
+            "head": review.head,
+            "stat": review.stat,
+        },
+        "verdict": verdict,
+    });
+    format!(
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'\">\n\
+<title>{title}</title>\n<style>\n{tokens}\n</style>\n</head>\n<body>\n\
+<header class=\"top\"><span class=\"brand\">keel</span><span class=\"mono id\">{item}</span>\
+<span class=\"mono dim\">{job}</span><span class=\"chip\">{state}</span></header>\n\
+<main><h1>{title}</h1><p class=\"chip\">{verdict}</p><pre class=\"body\">{summary}</pre>\
+<p class=\"mono\">{base}..{head}</p><pre class=\"body\">{stat}</pre></main>\n\
+<script type=\"application/json\" id=\"keel-doc\">{doc}</script>\n</body>\n</html>\n",
+        title = escape(&review.title),
+        tokens = TOKENS,
+        item = escape(&review.item_id),
+        job = escape(&review.job_id),
+        state = escape(&review.state),
+        verdict = escape(&review.verdict),
+        summary = escape(&review.summary),
+        base = escape(&review.base),
+        head = escape(&review.head),
+        stat = escape(&review.stat),
+        doc = json_for_html(&doc),
+    )
+}
+
 pub fn queue_page(queue: &QueueView) -> String {
     let mut rows = String::new();
     for row in &queue.rows {

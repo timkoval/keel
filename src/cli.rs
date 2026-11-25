@@ -75,6 +75,16 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
             print!("{}", render_status(&status));
             Ok(())
         }
+        Some("doctor") => {
+            no_args("doctor", args)?;
+            let body = daemon_json(config, "GET", "/v1/doctor", None)?;
+            if let Some(lines) = body.get("lines").and_then(Value::as_array) {
+                for line in lines {
+                    println!("{}", line.as_str().unwrap_or(""));
+                }
+            }
+            Ok(())
+        }
         Some("claim") => claim_cmd(config, &args[1..]),
         Some("run") => run_cmd(config, &args[1..]),
         Some("permit") => permit_cmd(config, &args[1..]),
@@ -100,6 +110,7 @@ fn usage() -> &'static str {
 usage:
   keel serve
   keel status
+  keel doctor
   keel add [--repo PATH] [--branch NAME] [--body TEXT] TITLE
   keel inbox
   keel list [--state STATE]

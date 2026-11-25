@@ -7,7 +7,9 @@ use rusqlite::{Connection, TransactionBehavior};
 /// and run in the same transaction.
 const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/001_init.sql"))];
 
-const LATEST: i32 = 1;
+pub(crate) const USER_VERSION: i32 = 1;
+
+const LATEST: i32 = USER_VERSION;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
