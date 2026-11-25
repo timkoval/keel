@@ -85,6 +85,9 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
         Some("submit") => submit_cmd(config, &args[1..]),
         Some("approve") => approve_cmd(config, &args[1..]),
         Some("drop") => drop_cmd(config, &args[1..]),
+        Some("accept") => accept_cmd(config, &args[1..]),
+        Some("reject") => reject_cmd(config, &args[1..]),
+        Some("merge") => merge_cmd(config, &args[1..]),
         Some(other) => {
             eprintln!("{}", usage());
             Err(Error::Invalid(format!("unknown command {other}")))
@@ -112,7 +115,10 @@ usage:
   keel waive ID POINT
   keel submit ID --token TOKEN [--file PATH]
   keel approve ID --base SHA
-  keel drop ID [--force]"
+  keel drop ID [--force]
+  keel accept ID
+  keel reject ID TEXT
+  keel merge ID [--continue|--abort]"
 }
 
 fn no_args(cmd: &str, args: &[String]) -> Result<()> {
@@ -857,6 +863,101 @@ fn approve_cmd(config: &Config, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn accept_cmd(config: &Config, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::Invalid("usage: keel accept ID".into()));
+    }
+    let path = job_action_path(config, &args[0], "accept")?;
+    let accepted = daemon_json(config, "POST", &path, Some(b"{}".to_vec()))?;
+    println!(
+        "{} {} {}",
+        accepted["id"].as_str().unwrap_or(""),
+        accepted["state"].as_str().unwrap_or(""),
+        accepted["item_state"].as_str().unwrap_or("")
+    );
+    Ok(())
+}
+
+fn reject_cmd(config: &Config, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(Error::Invalid("usage: keel reject ID TEXT".into()));
+    }
+    let path = job_action_path(config, &args[0], "reject")?;
+    let body = json!({ "text": args[1] });
+    let rejected = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!(
+        "{} {} {}",
+        rejected["id"].as_str().unwrap_or(""),
+        rejected["state"].as_str().unwrap_or(""),
+        rejected["item_state"].as_str().unwrap_or("")
+    );
+    Ok(())
+}
+
+fn merge_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut cont = false;
+    let mut abort = false;
+    for arg in args {
+        match arg.as_str() {
+            "--continue" => cont = true,
+            "--abort" => abort = true,
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+    }
+    if cont && abort {
+        return Err(Error::Invalid("merge cannot continue and abort".into()));
+    }
+    let id =
+        id.ok_or_else(|| Error::Invalid("usage: keel merge ID [--continue|--abort]".into()))?;
+    let path = item_action_path(config, &id, "merge")?;
+    let body = json!({ "continue": cont, "abort": abort });
+    // Several git merges run inside one request. The usual status timeout is too short.
+    let merged = daemon_json_timeout(
+        config,
+        "POST",
+        &path,
+        Some(body.to_string().into_bytes()),
+        Duration::from_secs(30),
+    )?;
+    println!(
+        "{} {}",
+        merged["id"].as_str().unwrap_or(""),
+        merged["state"].as_str().unwrap_or("")
+    );
+    if let Some(sha) = merged["merged_sha"].as_str() {
+        if !sha.is_empty() {
+            println!("{sha}");
+        }
+    }
+    if merged["conflict_kind"].as_str().is_some() {
+        if let Some(worktree) = merged["worktree"].as_str() {
+            println!("{worktree}");
+        }
+    }
+    Ok(())
+}
+
+fn job_action_path(config: &Config, id: &str, action: &str) -> Result<String> {
+    let resolved = resolve(config, id)?;
+    if resolved["kind"].as_str() != Some("job") {
+        return Err(Error::Invalid(format!("{action} takes a job id")));
+    }
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    if full_id.is_empty() {
+        return Err(Error::NotFound(id.to_string()));
+    }
+    Ok(format!("/v1/jobs/{full_id}/{action}"))
+}
+
 fn drop_cmd(config: &Config, args: &[String]) -> Result<()> {
     let mut id = None;
     let mut force = false;
@@ -965,9 +1066,19 @@ fn get_item(config: &Config, id: &str) -> Result<Value> {
 }
 
 fn daemon_json(config: &Config, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Value> {
+    daemon_json_timeout(config, method, path, body, Duration::from_secs(5))
+}
+
+fn daemon_json_timeout(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Value> {
     let mut stream = connect(config)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let response = http::exchange_with(
         &mut stream,
         method,
@@ -1642,6 +1753,490 @@ mod tests {
         assert!(crate::proc::group_empty(pgid).unwrap());
         assert!(!std::path::Path::new(&format!("/proc/{gpid}")).exists());
         assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
+        drop(running);
+    }
+
+    fn insert_item(
+        cfg: &crate::config::Config,
+        id: &str,
+        repo: Option<&str>,
+        base: Option<&str>,
+        state: &str,
+    ) {
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO items (
+                    id, title, body, source, repo, target_branch, base_sha, state,
+                    created_at, updated_at
+                 ) VALUES (
+                    ?1, 'Merge', '', 'cli', ?2, 'main', ?3, ?4,
+                    '2026-11-25T00:00:00Z', '2026-11-25T00:00:00Z'
+                 )",
+                params![id, repo, base, state],
+            )
+            .unwrap();
+    }
+
+    fn insert_job(
+        cfg: &crate::config::Config,
+        id: &str,
+        item: &str,
+        ord: i64,
+        state: &str,
+        branch: Option<&str>,
+        worktree: Option<&str>,
+        base: &str,
+    ) {
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (
+                    id, item_id, title, acceptance, state, depth, ord, branch, worktree,
+                    base_sha, updated_at
+                 ) VALUES (
+                    ?1, ?2, 'leaf', '', ?3, 1, ?4, ?5, ?6, ?7, '2026-11-25T00:00:00Z'
+                 )",
+                params![id, item, state, ord, branch, worktree, base],
+            )
+            .unwrap();
+    }
+
+    fn merge_head(repo: &std::path::Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[test]
+    fn accept_and_reject_do_not_run_git() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        // The socket is bound before the schema commit. Wait until a request is served.
+        dispatch(&cfg, &["status".into()]).unwrap();
+        insert_item(&cfg, "k_accept", None, None, "implementing");
+        insert_job(
+            &cfg,
+            "j_keep",
+            "k_accept",
+            0,
+            "feedback_pending",
+            Some("keel/k_accept/j_keep"),
+            None,
+            "",
+        );
+        insert_job(
+            &cfg,
+            "j_note",
+            "k_accept",
+            1,
+            "feedback_pending",
+            Some("keel/k_accept/j_note"),
+            None,
+            "",
+        );
+        let bare = {
+            let mut stream = UnixStream::connect(&cfg.socket_path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            crate::http::exchange(&mut stream, "POST", "/v1/jobs/j_keep/accept", Some(b"{}"))
+                .unwrap()
+        };
+        assert_eq!(bare.status, 400, "{}", String::from_utf8_lossy(&bare.body));
+        assert!(String::from_utf8_lossy(&bare.body).contains("cli only"));
+        let tcp = {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", cfg.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            crate::http::exchange(&mut stream, "POST", "/v1/jobs/j_keep/accept", Some(b"{}"))
+                .unwrap()
+        };
+        assert_eq!(tcp.status, 405);
+
+        dispatch(
+            &cfg,
+            &["reject".into(), "j_note".into(), "needs a test".into()],
+        )
+        .unwrap();
+        let (job_state, item_state, branch): (String, String, String) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT j.state, i.state, j.branch
+                 FROM jobs j JOIN items i ON i.id = j.item_id
+                 WHERE j.id = 'j_note'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(job_state, "queued");
+        assert_eq!(item_state, "implementing");
+        assert_eq!(branch, "keel/k_accept/j_note");
+        let note: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT text FROM job_notes WHERE job_id = 'j_note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "needs a test");
+        let rejected = dispatch(&cfg, &["accept".into(), "j_note".into()]).unwrap_err();
+        assert!(rejected.to_string().contains("409"), "{rejected}");
+
+        dispatch(&cfg, &["accept".into(), "j_keep".into()]).unwrap();
+        assert_eq!(state_of(&cfg, "k_accept"), "implementing");
+        let kept: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row("SELECT state FROM jobs WHERE id = 'j_keep'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "accepted");
+
+        insert_item(&cfg, "k_last", None, None, "implementing");
+        insert_job(
+            &cfg,
+            "j_last",
+            "k_last",
+            0,
+            "feedback_pending",
+            Some("keel/k_last/j_last"),
+            None,
+            "",
+        );
+        dispatch(&cfg, &["accept".into(), "j_last".into()]).unwrap();
+        assert_eq!(state_of(&cfg, "k_last"), "awaiting_merge");
+        assert!(dispatch(&cfg, &["merge".into(), "j_last".into()]).is_err());
+        assert!(dispatch(
+            &cfg,
+            &[
+                "merge".into(),
+                "k_last".into(),
+                "--continue".into(),
+                "--abort".into()
+            ]
+        )
+        .is_err());
+        drop(running);
+    }
+
+    #[test]
+    fn primary_conflict_stays_off_the_primary() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["status".into()]).unwrap();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let branch = "keel/k_conflict/j_leaf";
+        let leaf = _rm.0.join("leaf");
+        crate::git::add_branch(&repo, &leaf, branch, &base).unwrap();
+        crate::git::commit_file(&leaf, "README", b"leaf\n");
+        let moved = crate::git::commit_file(&repo, "README", b"primary\n");
+        assert_ne!(moved, base);
+        insert_item(
+            &cfg,
+            "k_conflict",
+            Some(repo.to_str().unwrap()),
+            Some(&base),
+            "awaiting_merge",
+        );
+        insert_job(
+            &cfg,
+            "j_leaf",
+            "k_conflict",
+            0,
+            "accepted",
+            Some(branch),
+            Some(leaf.to_str().unwrap()),
+            &base,
+        );
+
+        dispatch(&cfg, &["merge".into(), "k_conflict".into()]).unwrap();
+        let primary = crate::git::snapshot(&repo).unwrap();
+        assert_eq!(primary.head, moved);
+        assert_eq!(primary.branch, "main");
+        assert!(primary.porcelain.is_empty(), "{}", primary.porcelain);
+        assert!(!merge_head(&repo));
+        assert_eq!(
+            fs::read_to_string(repo.join("README")).unwrap(),
+            "primary\n"
+        );
+
+        let integ = cfg
+            .data_dir
+            .join("worktrees")
+            .join("k_conflict")
+            .join("integrate");
+        assert!(merge_head(&integ));
+        assert!(!crate::git::snapshot(&integ).unwrap().porcelain.is_empty());
+        let (state, kind, integrate_sha, ord): (String, String, String, i64) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state, conflict_kind, integrate_sha, integrate_ord FROM items WHERE id = 'k_conflict'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "merge_conflict");
+        assert_eq!(kind, "primary");
+        assert_eq!(ord, 0);
+        assert_eq!(
+            integrate_sha,
+            crate::git::rev_parse(&integ, "HEAD").unwrap()
+        );
+        assert_ne!(integrate_sha, moved);
+        assert!(leaf.is_dir());
+        assert!(crate::git::branch_exists(&repo, branch).unwrap());
+
+        let early = dispatch(
+            &cfg,
+            &["merge".into(), "k_conflict".into(), "--continue".into()],
+        )
+        .unwrap_err();
+        assert!(early.to_string().contains("unmerged"), "{early}");
+        assert!(
+            early.to_string().contains(integ.to_str().unwrap()),
+            "{early}"
+        );
+        assert_eq!(state_of(&cfg, "k_conflict"), "merge_conflict");
+        assert_eq!(crate::git::snapshot(&repo).unwrap().head, moved);
+
+        // Staged but not committed: `--continue` must finish the merge without MERGE_HEAD gone yet.
+        fs::write(integ.join("README"), "resolved\n").unwrap();
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&integ)
+            .args(["add", "--", "README"])
+            .status()
+            .unwrap();
+        assert!(added.success());
+        assert!(merge_head(&integ));
+        dispatch(
+            &cfg,
+            &["merge".into(), "k_conflict".into(), "--continue".into()],
+        )
+        .unwrap();
+        let primary = crate::git::snapshot(&repo).unwrap();
+        assert!(primary.porcelain.is_empty(), "{}", primary.porcelain);
+        assert_ne!(primary.head, moved);
+        assert!(!merge_head(&repo));
+        assert_eq!(
+            fs::read_to_string(repo.join("README")).unwrap(),
+            "resolved\n"
+        );
+        assert_eq!(state_of(&cfg, "k_conflict"), "merged");
+        let merged: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT merged_sha FROM items WHERE id = 'k_conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merged, primary.head);
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["merge-base", "--is-ancestor", &moved, "HEAD"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!leaf.exists());
+        assert!(!crate::git::branch_exists(&repo, branch).unwrap());
+        assert!(crate::git::branch_exists(&repo, "keel/k_conflict/integrate").unwrap());
+        let again = dispatch(&cfg, &["merge".into(), "k_conflict".into()]).unwrap_err();
+        assert!(again.to_string().contains("409"), "{again}");
+        drop(running);
+    }
+
+    #[test]
+    fn dirty_primary_is_refused_and_ords_are_not_remerged() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["status".into()]).unwrap();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let branch = "keel/k_dirty/j_leaf";
+        let leaf = _rm.0.join("leaf");
+        crate::git::add_branch(&repo, &leaf, branch, &base).unwrap();
+        crate::git::commit_file(&leaf, "extra.txt", b"from-leaf\n");
+        fs::write(repo.join("README"), "dirty\n").unwrap();
+        insert_item(
+            &cfg,
+            "k_dirty",
+            Some(repo.to_str().unwrap()),
+            Some(&base),
+            "awaiting_merge",
+        );
+        insert_job(
+            &cfg,
+            "j_dirty",
+            "k_dirty",
+            0,
+            "accepted",
+            Some(branch),
+            Some(leaf.to_str().unwrap()),
+            &base,
+        );
+        let refused = dispatch(&cfg, &["merge".into(), "k_dirty".into()]).unwrap_err();
+        assert!(refused.to_string().contains("dirty"), "{refused}");
+        assert_eq!(crate::git::snapshot(&repo).unwrap().head, base);
+        assert!(!crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        assert_eq!(state_of(&cfg, "k_dirty"), "awaiting_merge");
+        let integrate_sha: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT integrate_sha FROM items WHERE id = 'k_dirty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            integrate_sha,
+            crate::git::rev_parse(&repo, "keel/k_dirty/integrate").unwrap()
+        );
+        fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        dispatch(&cfg, &["merge".into(), "k_dirty".into()]).unwrap();
+        assert_eq!(
+            crate::git::rev_parse(&repo, "keel/k_dirty/integrate").unwrap(),
+            integrate_sha
+        );
+        let primary = crate::git::snapshot(&repo).unwrap();
+        assert!(primary.porcelain.is_empty(), "{}", primary.porcelain);
+        assert_ne!(primary.head, base);
+        assert_eq!(state_of(&cfg, "k_dirty"), "merged");
+        assert!(!crate::git::branch_exists(&repo, branch).unwrap());
+        let again = dispatch(&cfg, &["merge".into(), "k_dirty".into()]).unwrap_err();
+        assert!(again.to_string().contains("409"), "{again}");
+        drop(running);
+    }
+
+    #[test]
+    fn abort_throws_integrate_away_and_keeps_the_primary() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["status".into()]).unwrap();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let first = "keel/k_abort/j_one";
+        let second = "keel/k_abort/j_two";
+        let one = _rm.0.join("one");
+        let two = _rm.0.join("two");
+        crate::git::add_branch(&repo, &one, first, &base).unwrap();
+        crate::git::commit_file(&one, "only.txt", b"one\n");
+        crate::git::add_branch(&repo, &two, second, &base).unwrap();
+        crate::git::commit_file(&two, "only.txt", b"two\n");
+        insert_item(
+            &cfg,
+            "k_abort",
+            Some(repo.to_str().unwrap()),
+            Some(&base),
+            "awaiting_merge",
+        );
+        insert_job(
+            &cfg,
+            "j_one",
+            "k_abort",
+            0,
+            "accepted",
+            Some(first),
+            Some(one.to_str().unwrap()),
+            &base,
+        );
+        insert_job(
+            &cfg,
+            "j_two",
+            "k_abort",
+            1,
+            "accepted",
+            Some(second),
+            Some(two.to_str().unwrap()),
+            &base,
+        );
+        dispatch(&cfg, &["merge".into(), "k_abort".into()]).unwrap();
+        assert_eq!(crate::git::snapshot(&repo).unwrap().head, base);
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        assert!(!merge_head(&repo));
+        let integ = cfg
+            .data_dir
+            .join("worktrees")
+            .join("k_abort")
+            .join("integrate");
+        assert!(merge_head(&integ));
+        let kind: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT conflict_kind FROM items WHERE id = 'k_abort'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "integrate");
+        assert_eq!(state_of(&cfg, "k_abort"), "merge_conflict");
+        let recorded: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT integrate_sha FROM items WHERE id = 'k_abort'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&integ)
+            .args(["merge", "--abort"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let refused = dispatch(
+            &cfg,
+            &["merge".into(), "k_abort".into(), "--continue".into()],
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("--abort"), "{refused}");
+        assert_eq!(state_of(&cfg, "k_abort"), "merge_conflict");
+        let still: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT integrate_sha FROM items WHERE id = 'k_abort'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, recorded);
+
+        dispatch(&cfg, &["merge".into(), "k_abort".into(), "--abort".into()]).unwrap();
+        assert_eq!(state_of(&cfg, "k_abort"), "awaiting_merge");
+        assert_eq!(crate::git::rev_parse(&integ, "HEAD").unwrap(), base);
+        assert_eq!(crate::git::snapshot(&repo).unwrap().head, base);
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        let (sha, ord, conflict): (Option<String>, Option<i64>, Option<String>) = open(
+            &cfg.db_path,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT integrate_sha, integrate_ord, conflict_kind FROM items WHERE id = 'k_abort'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+        assert!(sha.is_none());
+        assert!(ord.is_none());
+        assert!(conflict.is_none());
+        assert!(crate::git::branch_exists(&repo, first).unwrap());
+        assert!(crate::git::branch_exists(&repo, second).unwrap());
+        assert!(one.is_dir());
+        assert!(two.is_dir());
         drop(running);
     }
 

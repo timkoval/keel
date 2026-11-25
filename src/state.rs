@@ -1502,7 +1502,11 @@ pub fn merge_item(conn: &mut Connection, item_id: &str, merged_sha: &str) -> Res
 pub fn mark_merge_conflict(conn: &mut Connection, item_id: &str, kind: ConflictKind) -> Result<()> {
     with_tx(conn, |tx| {
         let item = load_item(tx, item_id)?;
-        if item.state != ItemState::AwaitingMerge {
+        // A second primary conflict is already `merge_conflict`. The kind still changes.
+        if !matches!(
+            item.state,
+            ItemState::AwaitingMerge | ItemState::MergeConflict
+        ) {
             return Err(conflict(
                 item.state,
                 "merge conflict requires awaiting_merge",
@@ -1599,6 +1603,164 @@ pub fn merge_abort(conn: &mut Connection, item_id: &str) -> Result<()> {
         )?;
         Ok(())
     })
+}
+
+/// Last integrate commit that finished. `ord` is set when a leaf merge committed;
+/// `None` leaves `integrate_ord` so a primary-into-integrate merge does not rewind it.
+pub fn record_integrate(
+    conn: &mut Connection,
+    item_id: &str,
+    sha: &str,
+    ord: Option<i64>,
+) -> Result<()> {
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Invalid("integrate_sha is not a commit".into()));
+    }
+    with_tx(conn, |tx| {
+        let now = sql_now(tx)?;
+        let updated = if let Some(ord) = ord {
+            tx.execute(
+                "UPDATE items SET integrate_sha = ?1, integrate_ord = ?2, updated_at = ?3
+                 WHERE id = ?4 AND state IN ('awaiting_merge', 'merge_conflict')",
+                params![sha, ord, now, item_id],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE items SET integrate_sha = ?1, updated_at = ?2
+                 WHERE id = ?3 AND state IN ('awaiting_merge', 'merge_conflict')",
+                params![sha, now, item_id],
+            )?
+        };
+        if updated != 1 {
+            let item = load_item(tx, item_id)?;
+            return Err(conflict(
+                item.state,
+                "integrate progress requires awaiting_merge or merge_conflict",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub(crate) struct MergeFacts {
+    pub state: String,
+    pub repo: PathBuf,
+    pub target_branch: String,
+    pub base_sha: String,
+    pub integrate_sha: Option<String>,
+    pub integrate_ord: Option<i64>,
+    pub conflict_kind: Option<String>,
+    pub merged_sha: Option<String>,
+}
+
+pub(crate) struct MergeLeaf {
+    pub id: String,
+    pub ord: i64,
+    pub branch: Option<String>,
+}
+
+pub(crate) struct JobGit {
+    pub branch: Option<String>,
+    pub worktree: Option<PathBuf>,
+}
+
+pub(crate) fn merge_facts(
+    conn: &mut Connection,
+    item_id: &str,
+) -> Result<(MergeFacts, Vec<MergeLeaf>)> {
+    with_tx(conn, |tx| {
+        let row = tx
+            .query_row(
+                "SELECT state, repo, target_branch, base_sha, integrate_sha, integrate_ord,
+                        conflict_kind, merged_sha
+                 FROM items WHERE id = ?1",
+                params![item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            state,
+            repo,
+            target_branch,
+            base_sha,
+            integrate_sha,
+            integrate_ord,
+            conflict_kind,
+            merged_sha,
+        )) = row
+        else {
+            return Err(Error::NotFound(item_id.to_string()));
+        };
+        let repo = required_text(repo, "repo")?;
+        let target_branch = required_text(target_branch, "target_branch")?;
+        let base_sha = required_text(base_sha, "base_sha")?;
+        let mut stmt = tx.prepare(
+            "SELECT id, ord, branch FROM jobs
+             WHERE item_id = ?1 AND state = 'accepted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs child WHERE child.parent_job_id = jobs.id
+               )
+             ORDER BY ord ASC, id ASC",
+        )?;
+        let mapped = stmt.query_map(params![item_id], |row| {
+            Ok(MergeLeaf {
+                id: row.get(0)?,
+                ord: row.get(1)?,
+                branch: row.get(2)?,
+            })
+        })?;
+        let mut leaves = Vec::new();
+        for leaf in mapped {
+            leaves.push(leaf?);
+        }
+        Ok((
+            MergeFacts {
+                state,
+                repo: PathBuf::from(repo),
+                target_branch,
+                base_sha,
+                integrate_sha,
+                integrate_ord,
+                conflict_kind,
+                merged_sha,
+            },
+            leaves,
+        ))
+    })
+}
+
+pub(crate) fn job_checkouts(conn: &Connection, item_id: &str) -> Result<Vec<JobGit>> {
+    let mut stmt = conn
+        .prepare("SELECT branch, worktree FROM jobs WHERE item_id = ?1 ORDER BY ord ASC, id ASC")?;
+    let mapped = stmt.query_map(params![item_id], |row| {
+        Ok(JobGit {
+            branch: row.get(0)?,
+            worktree: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+        })
+    })?;
+    let mut jobs = Vec::new();
+    for job in mapped {
+        jobs.push(job?);
+    }
+    Ok(jobs)
+}
+
+fn required_text(value: Option<String>, name: &str) -> Result<String> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => Err(Error::Invalid(format!("{name} is unset"))),
+    }
 }
 
 pub fn validate_plan_json(document: &str) -> Result<PlanDocument> {

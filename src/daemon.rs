@@ -304,6 +304,9 @@ fn action_route(path: &str) -> Option<(Target, &str, &str)> {
             | "drop"
             | "submit"
             | "permit"
+            | "accept"
+            | "reject"
+            | "merge"
     ) {
         return None;
     }
@@ -477,8 +480,22 @@ fn mutate_response(
         }),
         "submit" => item_action(target, action, || submit_response(shared, id, req)),
         "permit" => permit_response(shared, target, id, req, surface_cli),
+        "accept" => job_action(target, action, || accept_response(shared, id, surface_cli)),
+        "reject" => job_action(target, action, || {
+            reject_response(shared, id, req, surface_cli)
+        }),
+        "merge" => item_action(target, action, || {
+            merge_response(shared, id, req, surface_cli)
+        }),
         _ => missing(action),
     }
+}
+
+fn job_action(target: Target, action: &str, call: impl FnOnce() -> Response) -> Response {
+    if target != Target::Job {
+        return fail(Error::Invalid(format!("{action} is a job route")));
+    }
+    call()
 }
 
 fn item_action(target: Target, action: &str, call: impl FnOnce() -> Response) -> Response {
@@ -582,6 +599,125 @@ pub(crate) fn abandon_failed_spawn(
         let _ = claim::release(db, target, id, state::Release::human(), data_dir);
     }
     failure.error
+}
+
+fn accept_response(shared: &Shared, id: &str, surface_cli: bool) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let accepted = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match state::accept_job(&mut conn, id) {
+            Ok(()) => job_view(&conn, id),
+            Err(err) => Err(err),
+        }
+    };
+    match accepted {
+        Ok((job_state, item_id, item_state)) => Response::json(
+            200,
+            json!({
+                "id": id,
+                "state": job_state,
+                "item_id": item_id,
+                "item_state": item_state,
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn reject_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let text = match required_string(&obj, "text") {
+        Ok(text) => text,
+        Err(err) => return fail(err),
+    };
+    let rejected = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match state::reject_job(&mut conn, id, &text) {
+            Ok(()) => job_view(&conn, id),
+            Err(err) => Err(err),
+        }
+    };
+    match rejected {
+        Ok((job_state, item_id, item_state)) => Response::json(
+            200,
+            json!({
+                "id": id,
+                "state": job_state,
+                "item_id": item_id,
+                "item_state": item_state,
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn merge_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let obj = match json_object_or_empty(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let cont = match optional_bool(&obj, "continue") {
+        Ok(cont) => cont,
+        Err(err) => return fail(err),
+    };
+    let abort = match optional_bool(&obj, "abort") {
+        Ok(abort) => abort,
+        Err(err) => return fail(err),
+    };
+    if cont && abort {
+        return fail(Error::Invalid("merge cannot continue and abort".into()));
+    }
+    let mode = if abort {
+        crate::git::MergeMode::Abort
+    } else if cont {
+        crate::git::MergeMode::Continue
+    } else {
+        crate::git::MergeMode::Plain
+    };
+    // Git runs outside the SQLite mutex. The flock lives inside merge_local.
+    match crate::git::merge_local(&shared.db, &shared.config.data_dir, id, mode) {
+        Ok(report) => Response::json(
+            200,
+            json!({
+                "id": report.id,
+                "state": report.state,
+                "merged_sha": report.merged_sha,
+                "integrate_sha": report.integrate_sha,
+                "conflict_kind": report.conflict_kind,
+                "worktree": report.worktree.display().to_string(),
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn job_view(conn: &Connection, id: &str) -> Result<(String, String, String)> {
+    conn.query_row(
+        "SELECT j.state, i.id, i.state
+         FROM jobs j JOIN items i ON i.id = j.item_id
+         WHERE j.id = ?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
 }
 
 fn permit_response(
