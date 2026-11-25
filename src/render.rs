@@ -65,6 +65,8 @@ pub struct QueueLink {
     pub title: String,
     pub summary: String,
     pub url: String,
+    /// Set for a feedback row. The review document is not served yet.
+    pub item_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +396,7 @@ mod tests {
                 title: "A <b>".into(),
                 summary: "sum".into(),
                 url: "http://127.0.0.1:7431/i/k_abc/plan".into(),
+                item_id: None,
             }],
         });
         assert!(!html.to_ascii_lowercase().contains("<button"));

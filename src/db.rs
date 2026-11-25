@@ -5,9 +5,12 @@ use rusqlite::{Connection, TransactionBehavior};
 
 /// Schema version written by [`migrate`]. Later SQL files append to this list
 /// and run in the same transaction.
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/001_init.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/001_init.sql")),
+    (2, include_str!("../migrations/002_claim_snapshot.sql")),
+];
 
-const LATEST: i32 = 1;
+const LATEST: i32 = 2;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -151,7 +154,15 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
+        let column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'claim_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, 1);
         let index: String = conn
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_items_state'",
@@ -166,7 +177,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         drop(conn);
 
         let conn = Connection::open(&path).unwrap();
