@@ -1607,6 +1607,8 @@ pub fn merge_abort(conn: &mut Connection, item_id: &str) -> Result<()> {
 
 /// Last integrate commit that finished. `ord` is set when a leaf merge committed;
 /// `None` leaves `integrate_ord` so a primary-into-integrate merge does not rewind it.
+/// `conflict_kind` is cleared: this sha is finished, so a later primary pre-check
+/// failure must not look like a leaf merge the human aborted in place.
 pub fn record_integrate(
     conn: &mut Connection,
     item_id: &str,
@@ -1620,13 +1622,17 @@ pub fn record_integrate(
         let now = sql_now(tx)?;
         let updated = if let Some(ord) = ord {
             tx.execute(
-                "UPDATE items SET integrate_sha = ?1, integrate_ord = ?2, updated_at = ?3
+                "UPDATE items SET
+                    integrate_sha = ?1,
+                    integrate_ord = ?2,
+                    conflict_kind = NULL,
+                    updated_at = ?3
                  WHERE id = ?4 AND state IN ('awaiting_merge', 'merge_conflict')",
                 params![sha, ord, now, item_id],
             )?
         } else {
             tx.execute(
-                "UPDATE items SET integrate_sha = ?1, updated_at = ?2
+                "UPDATE items SET integrate_sha = ?1, conflict_kind = NULL, updated_at = ?2
                  WHERE id = ?3 AND state IN ('awaiting_merge', 'merge_conflict')",
                 params![sha, now, item_id],
             )?
@@ -1660,6 +1666,7 @@ pub(crate) struct MergeLeaf {
 }
 
 pub(crate) struct JobGit {
+    pub ord: i64,
     pub branch: Option<String>,
     pub worktree: Option<PathBuf>,
 }
@@ -1741,12 +1748,14 @@ pub(crate) fn merge_facts(
 }
 
 pub(crate) fn job_checkouts(conn: &Connection, item_id: &str) -> Result<Vec<JobGit>> {
-    let mut stmt = conn
-        .prepare("SELECT branch, worktree FROM jobs WHERE item_id = ?1 ORDER BY ord ASC, id ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT ord, branch, worktree FROM jobs WHERE item_id = ?1 ORDER BY ord ASC, id ASC",
+    )?;
     let mapped = stmt.query_map(params![item_id], |row| {
         Ok(JobGit {
-            branch: row.get(0)?,
-            worktree: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+            ord: row.get(0)?,
+            branch: row.get(1)?,
+            worktree: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
         })
     })?;
     let mut jobs = Vec::new();

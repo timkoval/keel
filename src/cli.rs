@@ -2240,6 +2240,188 @@ mod tests {
         drop(running);
     }
 
+    #[test]
+    fn continue_merges_leaves_after_the_conflict() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["status".into()]).unwrap();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let branches = ["keel/k_three/j0", "keel/k_three/j1", "keel/k_three/j2"];
+        let wts = [_rm.0.join("w0"), _rm.0.join("w1"), _rm.0.join("w2")];
+        crate::git::add_branch(&repo, &wts[0], branches[0], &base).unwrap();
+        crate::git::commit_file(&wts[0], "shared.txt", b"zero\n");
+        crate::git::add_branch(&repo, &wts[1], branches[1], &base).unwrap();
+        crate::git::commit_file(&wts[1], "shared.txt", b"one\n");
+        crate::git::add_branch(&repo, &wts[2], branches[2], &base).unwrap();
+        let third = crate::git::commit_file(&wts[2], "third.txt", b"three\n");
+        insert_item(
+            &cfg,
+            "k_three",
+            Some(repo.to_str().unwrap()),
+            Some(&base),
+            "awaiting_merge",
+        );
+        for (ord, (branch, wt)) in branches.iter().zip(wts.iter()).enumerate() {
+            insert_job(
+                &cfg,
+                &format!("j{ord}"),
+                "k_three",
+                ord as i64,
+                "accepted",
+                Some(branch),
+                Some(wt.to_str().unwrap()),
+                &base,
+            );
+        }
+        dispatch(&cfg, &["merge".into(), "k_three".into()]).unwrap();
+        let integ = cfg
+            .data_dir
+            .join("worktrees")
+            .join("k_three")
+            .join("integrate");
+        assert!(merge_head(&integ));
+        assert!(!integ.join("third.txt").exists());
+        assert!(crate::git::branch_exists(&repo, branches[2]).unwrap());
+        assert_eq!(state_of(&cfg, "k_three"), "merge_conflict");
+        fs::write(integ.join("shared.txt"), "resolved\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&integ)
+            .args(["add", "--", "shared.txt"])
+            .status()
+            .unwrap()
+            .success());
+        dispatch(
+            &cfg,
+            &["merge".into(), "k_three".into(), "--continue".into()],
+        )
+        .unwrap();
+        assert_eq!(state_of(&cfg, "k_three"), "merged");
+        assert_eq!(
+            fs::read_to_string(repo.join("third.txt")).unwrap(),
+            "three\n"
+        );
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["merge-base", "--is-ancestor", &third, "HEAD"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!crate::git::branch_exists(&repo, branches[2]).unwrap());
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        drop(running);
+    }
+
+    #[test]
+    fn continue_after_a_dirty_primary_does_not_demand_abort() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["status".into()]).unwrap();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let first = "keel/k_retry/j0";
+        let second = "keel/k_retry/j1";
+        let one = _rm.0.join("one");
+        let two = _rm.0.join("two");
+        crate::git::add_branch(&repo, &one, first, &base).unwrap();
+        crate::git::commit_file(&one, "shared.txt", b"zero\n");
+        crate::git::add_branch(&repo, &two, second, &base).unwrap();
+        crate::git::commit_file(&two, "shared.txt", b"one\n");
+        insert_item(
+            &cfg,
+            "k_retry",
+            Some(repo.to_str().unwrap()),
+            Some(&base),
+            "awaiting_merge",
+        );
+        insert_job(
+            &cfg,
+            "j0",
+            "k_retry",
+            0,
+            "accepted",
+            Some(first),
+            Some(one.to_str().unwrap()),
+            &base,
+        );
+        insert_job(
+            &cfg,
+            "j1",
+            "k_retry",
+            1,
+            "accepted",
+            Some(second),
+            Some(two.to_str().unwrap()),
+            &base,
+        );
+        dispatch(&cfg, &["merge".into(), "k_retry".into()]).unwrap();
+        let integ = cfg
+            .data_dir
+            .join("worktrees")
+            .join("k_retry")
+            .join("integrate");
+        assert!(merge_head(&integ));
+        fs::write(repo.join("README"), "dirty\n").unwrap();
+        fs::write(integ.join("shared.txt"), "resolved\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&integ)
+            .args(["add", "--", "shared.txt"])
+            .status()
+            .unwrap()
+            .success());
+        let refused = dispatch(
+            &cfg,
+            &["merge".into(), "k_retry".into(), "--continue".into()],
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("dirty"), "{refused}");
+        assert!(!refused.to_string().contains("--abort"), "{refused}");
+        assert_eq!(state_of(&cfg, "k_retry"), "merge_conflict");
+        let (kind, sha): (Option<String>, String) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT conflict_kind, integrate_sha FROM items WHERE id = 'k_retry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(kind.is_none());
+        assert_eq!(sha, crate::git::rev_parse(&integ, "HEAD").unwrap());
+        assert!(crate::git::branch_exists(&repo, second).unwrap());
+        let again = dispatch(
+            &cfg,
+            &["merge".into(), "k_retry".into(), "--continue".into()],
+        )
+        .unwrap_err();
+        assert!(again.to_string().contains("dirty"), "{again}");
+        assert!(!again.to_string().contains("--abort"), "{again}");
+        let sha_again: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT integrate_sha FROM items WHERE id = 'k_retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sha_again, sha);
+        fs::write(repo.join("README"), "one\n").unwrap();
+        dispatch(
+            &cfg,
+            &["merge".into(), "k_retry".into(), "--continue".into()],
+        )
+        .unwrap();
+        assert_eq!(state_of(&cfg, "k_retry"), "merged");
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        assert_eq!(
+            fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "resolved\n"
+        );
+        drop(running);
+    }
+
     fn state_of(cfg: &crate::config::Config, id: &str) -> String {
         open(&cfg.db_path)
             .unwrap()

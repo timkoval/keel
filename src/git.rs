@@ -305,7 +305,11 @@ pub(crate) fn merge_local(
         MergeMode::Abort => throw_integrate(db, item_id, &facts, &branch, &worktree)?,
         MergeMode::Continue => {
             continue_integrate(db, item_id, &mut facts, &branch, &worktree)?;
-            primary_phase(db, item_id, &facts, &branch, &worktree)?;
+            // The commit just stored finished one leaf. Later accepted leaves
+            // still have to land before the primary merge.
+            if !resume_leaves(db, item_id, &mut facts, &leaves, &branch, &worktree)? {
+                primary_phase(db, item_id, &facts, &branch, &worktree)?;
+            }
         }
         MergeMode::Plain => {
             if !resume_leaves(db, item_id, &mut facts, &leaves, &branch, &worktree)? {
@@ -388,7 +392,10 @@ fn continue_integrate(
         .unwrap_or_else(|| facts.base_sha.clone());
     let head = rev_parse(worktree, "HEAD")?;
     if head == anchor {
-        // The human aborted the leaf merge in place. `--continue` would retry it forever.
+        // Only when the human aborted the leaf merge in place: HEAD is still the
+        // pre-resolution sha and conflict_kind is still integrate. A recorded
+        // resolution clears conflict_kind, so a later primary pre-check failure
+        // stays retryable instead of demanding --abort.
         if facts.conflict_kind.as_deref() == Some("integrate") {
             return Err(Error::Invalid(
                 "integrate HEAD did not move; run keel merge --abort".into(),
@@ -513,20 +520,25 @@ fn primary_phase(
 
 fn commit_merged(db: &Mutex<Connection>, repo: &Path, item_id: &str) -> Result<()> {
     let sha = rev_parse(repo, "HEAD")?;
-    let jobs = {
+    let (recorded, jobs) = {
         let mut conn = lock_db(db)?;
         let (facts, _) = state::merge_facts(&mut conn, item_id)?;
         let jobs = state::job_checkouts(&conn, item_id)?;
         // The row is merged before any worktree is removed. Deleting a checkout
         // is not what makes the merge true.
+        let recorded = facts.integrate_ord;
         if facts.state == "merge_conflict" {
             state::merge_continue(&mut conn, item_id, &sha)?;
         } else {
             state::merge_item(&mut conn, item_id, &sha)?;
         }
-        jobs
+        (recorded, jobs)
     };
     for job in jobs {
+        // An ord past the last recorded leaf was never merged. Keep that branch.
+        if recorded.map(|done| job.ord > done).unwrap_or(true) {
+            continue;
+        }
         if let Some(path) = job.worktree.as_ref().filter(|path| path.exists()) {
             remove_worktree(repo, path)?;
         }
@@ -632,6 +644,7 @@ fn store_integrate(
 ) -> Result<()> {
     store_sha(db, item_id, sha, ord)?;
     facts.integrate_sha = Some(sha.to_string());
+    facts.conflict_kind = None;
     if let Some(ord) = ord {
         facts.integrate_ord = Some(ord);
     }
