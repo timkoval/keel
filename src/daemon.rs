@@ -658,6 +658,16 @@ fn finish_grok(
         Err(err) => Err(err),
     };
     if let Err(err) = outcome {
+        // A group that survived SIGKILL stays leased. fail_implement and a
+        // human release would clear the row without signaling it.
+        if grok::group_still_live(&err) {
+            note_log(
+                &shared.config.data_dir,
+                &launch.id,
+                "grok process group is still live; lease kept",
+            );
+            return;
+        }
         let _ = abandon_grok(shared, launch, &err.to_string());
     }
 }
@@ -786,6 +796,12 @@ fn abandon_grok(shared: &Shared, launch: &grok::Launch, reason: &str) -> Result<
         &launch.id,
         &format!("grok: {reason}"),
     );
+    if reason.contains("process group is not empty") {
+        return Err(Error::Conflict {
+            state: "leased".into(),
+            message: "process group is not empty".into(),
+        });
+    }
     if launch.role == state::Role::Implement {
         let dirty = launch
             .worktree

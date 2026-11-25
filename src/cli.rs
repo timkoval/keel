@@ -383,12 +383,20 @@ fn permit_cmd(config: &Config, args: &[String]) -> Result<()> {
 fn permit_until_idle(config: &Config, id: &str) -> Result<()> {
     let mut answered = String::new();
     loop {
-        let lease = daemon_json(
+        let lease = match daemon_json(
             config,
             "GET",
             &format!("/v1/lease/{}", url_encode(id)),
             None,
-        )?;
+        ) {
+            Ok(lease) => lease,
+            Err(err) => {
+                // A blip must not drop the prompt while the ACP task is blocked.
+                eprintln!("permit: {err}");
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
         if !lease
             .get("claimed")
             .and_then(Value::as_bool)
@@ -396,28 +404,46 @@ fn permit_until_idle(config: &Config, id: &str) -> Result<()> {
         {
             return Ok(());
         }
-        if let Some(pending) = lease.get("pending_permit") {
-            if pending.get("phase").and_then(Value::as_str) == Some("waiting") {
-                let key = pending
-                    .get("request_id")
-                    .map(|value| value.to_string())
-                    .unwrap_or_default();
-                if answered != key {
-                    eprint_permit(pending);
-                    let choice = read_choice()?;
-                    let kind = lease.get("kind").and_then(Value::as_str).unwrap_or("job");
-                    let path = match kind {
-                        "item" => format!("/v1/items/{id}/permit"),
-                        _ => format!("/v1/jobs/{id}/permit"),
-                    };
-                    daemon_json(
-                        config,
-                        "POST",
-                        &path,
-                        Some(json!({ "choice": choice }).to_string().into_bytes()),
-                    )?;
-                    answered = key;
-                }
+        let waiting = lease
+            .get("pending_permit")
+            .filter(|pending| pending.get("phase").and_then(Value::as_str) == Some("waiting"));
+        let Some(pending) = waiting else {
+            answered.clear();
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        let key = pending
+            .get("request_id")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if answered == key {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        eprint_permit(pending);
+        let choice = match read_choice() {
+            Ok(choice) => choice,
+            Err(err) => {
+                eprintln!("permit: {err}");
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+        let kind = lease.get("kind").and_then(Value::as_str).unwrap_or("job");
+        let path = match kind {
+            "item" => format!("/v1/items/{id}/permit"),
+            _ => format!("/v1/jobs/{id}/permit"),
+        };
+        match daemon_json(
+            config,
+            "POST",
+            &path,
+            Some(json!({ "choice": choice }).to_string().into_bytes()),
+        ) {
+            Ok(_) => answered = key,
+            Err(err) => {
+                // Still waiting. Print the error and ask again on the next pass.
+                eprintln!("permit: {err}");
             }
         }
         thread::sleep(Duration::from_millis(200));

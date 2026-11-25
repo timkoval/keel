@@ -702,6 +702,44 @@ pub fn attach_process(
     })
 }
 
+/// Swap the recorded leader after the previous group was emptied. A release
+/// that already cleared the row does not match, so the new child is not adopted
+/// onto a lease the human gave up.
+pub fn replace_attached_process(
+    conn: &mut Connection,
+    id: &str,
+    claim_token: &str,
+    old_pid: i64,
+    pid: i64,
+    pgid: i64,
+    starttime: &str,
+) -> Result<()> {
+    if old_pid <= 0 || pid <= 0 || pgid <= 0 || pid != pgid || starttime.is_empty() {
+        return Err(Error::Invalid(
+            "pid and pgid must be equal and positive, with starttime".into(),
+        ));
+    }
+    with_tx(conn, |tx| {
+        let item_rows = tx.execute(
+            "UPDATE items SET claim_pid = ?1, claim_pgid = ?2, claim_starttime = ?3
+             WHERE id = ?4 AND claim_token = ?5 AND claim_external = 0 AND claim_pid = ?6",
+            params![pid, pgid, starttime, id, claim_token, old_pid],
+        )?;
+        let job_rows = tx.execute(
+            "UPDATE jobs SET claim_pid = ?1, claim_pgid = ?2, claim_starttime = ?3
+             WHERE id = ?4 AND claim_token = ?5 AND claim_external = 0 AND claim_pid = ?6",
+            params![pid, pgid, starttime, id, claim_token, old_pid],
+        )?;
+        if item_rows + job_rows == 1 {
+            return Ok(());
+        }
+        if item_rows + job_rows > 1 {
+            return Err(conflict(id, "id matches both an item and a job"));
+        }
+        Err(conflict(id, "claim_pid was not replaced"))
+    })
+}
+
 pub fn heartbeat_item(conn: &mut Connection, item_id: &str, claim_token: &str) -> Result<()> {
     with_tx(conn, |tx| {
         let updated = tx.execute(
@@ -718,7 +756,9 @@ pub fn heartbeat_item(conn: &mut Connection, item_id: &str, claim_token: &str) -
     })
 }
 
-/// Grok jobs store `ask`. There is no path that writes `always-approve`.
+/// Stored only because the grok argv passes `--permission-mode default`, which
+/// forces this launch out of config `always-approve` and `auto`. There is no
+/// path that writes `always-approve`.
 pub fn set_job_permission_ask(
     conn: &mut Connection,
     job_id: &str,
@@ -3419,6 +3459,8 @@ mod tests {
         assert!(attach_process(&mut conn, &id, "stale", 8, 8, "t").is_err());
         attach_process(&mut conn, &id, &claim.token, 8, 8, "t").unwrap();
         assert!(attach_process(&mut conn, &id, &claim.token, 8, 8, "t").is_err());
+        assert!(replace_attached_process(&mut conn, &id, &claim.token, 7, 9, 9, "u").is_err());
+        replace_attached_process(&mut conn, &id, &claim.token, 8, 9, 9, "u").unwrap();
         let (pid, pgid, start): (i64, i64, String) = conn
             .query_row(
                 "SELECT claim_pid, claim_pgid, claim_starttime FROM items WHERE id = ?1",
@@ -3426,7 +3468,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((pid, pgid, start), (8, 8, "t".into()));
+        assert_eq!((pid, pgid, start), (9, 9, "u".into()));
         conn.execute(
             "UPDATE items SET lease_until = '2000-01-01T00:00:00Z' WHERE id = ?1",
             params![id],

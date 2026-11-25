@@ -100,7 +100,12 @@ pub(crate) fn serve_args(port: u16, secret: &str) -> Result<Vec<String>> {
     if secret.is_empty() || secret.contains([' ', '\n', '\r']) {
         return Err(Error::Invalid("grok secret is empty".into()));
     }
+    // Clap has no `ask` value. `default` is the accepted spelling that turns
+    // config `always-approve` and `auto` off for this launch. It has to sit
+    // before `agent`; `serve` itself rejects `--permission-mode`.
     Ok(vec![
+        "--permission-mode".into(),
+        "default".into(),
         "agent".into(),
         "--no-leader".into(),
         "serve".into(),
@@ -109,6 +114,14 @@ pub(crate) fn serve_args(port: u16, secret: &str) -> Result<Vec<String>> {
         "--secret".into(),
         secret.into(),
     ])
+}
+
+/// `empty_group` uses this message when SIGKILL leaves the group occupied.
+pub(crate) fn group_still_live(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Conflict { message, .. } if message == "process group is not empty"
+    )
 }
 
 pub(crate) fn ws_url(port: u16) -> String {
@@ -147,41 +160,66 @@ pub(crate) fn execute(
 
     let mut slot = Slot::default();
     let mut last_err = Error::Invalid("grok serve did not start".into());
+    // The pid already stored on the row. A bind retry replaces it only after
+    // that group is empty, so a release during dial still goes through the
+    // supervisor instead of the null-pid path.
+    let mut previous_pid: Option<i64> = None;
     for attempt in 0..2 {
         let port = pick_port()?;
         let args = serve_args(port, &secret)?;
         let spawned = spawn_grouped(&bin, &args, &log_path)?;
         let starttime = spawned.starttime.clone();
+        let pid = spawned.pid;
+        let pgid = spawned.pgid;
         let mut held = ChildGuard {
             child: Some(spawned.child),
-            pid: spawned.pid,
-            pgid: spawned.pgid,
+            pid,
+            pgid,
+            settled: false,
         };
-        // A dead leader is a failed bind. Pick another port once, before
-        // claim_pid is set, so the supervisor is not attached to a corpse.
-        if leader_dead(held.pid) {
+        let recorded = {
+            let mut conn = lock_db(db)?;
+            match previous_pid {
+                None => state::attach_process(
+                    &mut conn,
+                    &launch.id,
+                    &launch.token,
+                    pid,
+                    pgid,
+                    &starttime,
+                ),
+                Some(old) => state::replace_attached_process(
+                    &mut conn,
+                    &launch.id,
+                    &launch.token,
+                    old,
+                    pid,
+                    pgid,
+                    &starttime,
+                ),
+            }
+        };
+        if let Err(err) = recorded {
+            return stop_held(&mut held, err);
+        }
+        // A dead leader is a failed bind. Kill it, and pick another port only
+        // when the group is actually empty.
+        if leader_dead(pid) {
             last_err = Error::Invalid(format!(
                 "grok serve exited {}",
                 log_tail(&log_path, &secret)
             ));
-            if attempt == 0 {
-                continue;
-            }
-            return Err(last_err);
-        }
-        match slot.connect_once(|| dial(port, &secret, held.pid)) {
-            Ok(socket) => {
-                {
-                    let mut conn = lock_db(db)?;
-                    state::attach_process(
-                        &mut conn,
-                        &launch.id,
-                        &launch.token,
-                        held.pid,
-                        held.pgid,
-                        &starttime,
-                    )?;
+            match held.reap() {
+                Err(live) => return Err(live),
+                Ok(()) if attempt == 0 => {
+                    previous_pid = Some(pid);
+                    continue;
                 }
+                Ok(()) => return Err(last_err),
+            }
+        }
+        match slot.connect_once(|| dial(port, &secret, pid)) {
+            Ok(socket) => {
                 let stop = Arc::new(AtomicBool::new(false));
                 let spoken = thread::scope(|scope| {
                     let flag = Arc::clone(&stop);
@@ -202,24 +240,35 @@ pub(crate) fn execute(
                     stop.store(true, Ordering::SeqCst);
                     result
                 });
-                held.shutdown();
+                held.reap()?;
                 spoken?;
                 return Ok(RunDone {
                     output: read_output(&output_path)?,
                 });
             }
             Err(err) => {
-                let dead = leader_dead(held.pid);
-                held.shutdown();
+                let dead = leader_dead(pid);
                 last_err = Error::Invalid(format!("{err} {}", log_tail(&log_path, &secret)));
-                if attempt == 0 && dead {
-                    continue;
+                match held.reap() {
+                    Err(live) => return Err(live),
+                    Ok(()) if attempt == 0 && dead => {
+                        previous_pid = Some(pid);
+                        continue;
+                    }
+                    Ok(()) => return Err(last_err),
                 }
-                return Err(last_err);
             }
         }
     }
     Err(last_err)
+}
+
+/// The child is already in its own group. A live group must stay leased.
+fn stop_held<T>(held: &mut ChildGuard, err: Error) -> Result<T> {
+    match held.reap() {
+        Err(live) => Err(live),
+        Ok(()) => Err(err),
+    }
 }
 
 fn speak(cwd: &Path, prompt: &str, mut socket: Socket, session: &Session) -> Result<()> {
@@ -914,20 +963,32 @@ struct ChildGuard {
     child: Option<Child>,
     pid: i64,
     pgid: i64,
+    settled: bool,
 }
 
 impl ChildGuard {
-    fn shutdown(&mut self) {
-        let _ = proc::empty_group(self.pgid, self.pid);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
+    /// `Err` means the group survived SIGKILL. Do not wait: the child is still
+    /// running, and a blocked `wait` would hide that from the caller.
+    fn reap(&mut self) -> Result<()> {
+        if self.settled && self.child.is_none() {
+            return Ok(());
         }
+        let result = proc::empty_group(self.pgid, self.pid);
+        self.settled = true;
+        if result.is_ok() {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
+        }
+        result
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        self.shutdown();
+        if !self.settled {
+            let _ = self.reap();
+        }
     }
 }
 
@@ -968,12 +1029,14 @@ fn spawn_grouped(program: &Path, args: &[String], log_path: &Path) -> Result<Spa
             pgid,
             starttime,
         }),
-        Err(err) => {
-            // Wait after the signal. A zombie still keeps the process group.
-            let _ = proc::empty_group(pid, pid);
-            let _ = child.wait();
-            Err(err)
-        }
+        Err(err) => match proc::empty_group(pid, pid) {
+            Ok(()) => {
+                // Wait after the signal. A zombie still keeps the process group.
+                let _ = child.wait();
+                Err(err)
+            }
+            Err(live) => Err(live),
+        },
     }
 }
 
@@ -1084,6 +1147,8 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "--permission-mode",
+                "default",
                 "agent",
                 "--no-leader",
                 "serve",
@@ -1269,10 +1334,11 @@ mod tests {
             child: Some(spawned.child),
             pid,
             pgid,
+            settled: false,
         };
         assert_eq!(pid, pgid);
         assert_eq!(read_pgrp(pid as u32), Some(pgid));
-        guard.shutdown();
+        guard.reap().unwrap();
         assert!(proc::group_empty(pgid).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
