@@ -2467,6 +2467,93 @@ mod tests {
         drop(running);
     }
 
+    #[test]
+    fn merge_uses_leaf_ord_and_does_not_commit_the_container() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(&cfg, &["status".into()]).unwrap();
+        let repo = _rm.0.join("repo");
+        let base = crate::git::init_repo(&repo);
+        let first = "keel/k_nest/j_first";
+        let boxed = "keel/k_nest/j_box";
+        let second = "keel/k_nest/j_second";
+        let one = _rm.0.join("one");
+        let box_wt = _rm.0.join("box");
+        let two = _rm.0.join("two");
+        crate::git::add_branch(&repo, &one, first, &base).unwrap();
+        crate::git::commit_file(&one, "a.txt", b"a\n");
+        crate::git::add_branch(&repo, &box_wt, boxed, &base).unwrap();
+        crate::git::commit_file(&box_wt, "box.txt", b"box\n");
+        crate::git::add_branch(&repo, &two, second, &base).unwrap();
+        crate::git::commit_file(&two, "b.txt", b"b\n");
+        insert_item(
+            &cfg,
+            "k_nest",
+            Some(repo.to_str().unwrap()),
+            Some(&base),
+            "awaiting_merge",
+        );
+        insert_job(
+            &cfg,
+            "j_first",
+            "k_nest",
+            0,
+            "accepted",
+            Some(first),
+            Some(one.to_str().unwrap()),
+            &base,
+        );
+        insert_job(
+            &cfg,
+            "j_box",
+            "k_nest",
+            1,
+            "accepted",
+            Some(boxed),
+            Some(box_wt.to_str().unwrap()),
+            &base,
+        );
+        insert_job(
+            &cfg,
+            "j_second",
+            "k_nest",
+            2,
+            "accepted",
+            Some(second),
+            Some(two.to_str().unwrap()),
+            &base,
+        );
+        // The middle row is a container only because it has a child. Its branch
+        // is a decoy: merge must not land that commit between the leaves.
+        open(&cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET parent_job_id = 'j_box', depth = 2 WHERE id = 'j_second'",
+                [],
+            )
+            .unwrap();
+        dispatch(&cfg, &["merge".into(), "k_nest".into()]).unwrap();
+        assert_eq!(state_of(&cfg, "k_nest"), "merged");
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+        assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b\n");
+        assert!(!repo.join("box.txt").exists());
+        let ord: i64 = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT integrate_ord FROM items WHERE id = 'k_nest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ord, 2);
+        assert!(!crate::git::branch_exists(&repo, first).unwrap());
+        assert!(!crate::git::branch_exists(&repo, second).unwrap());
+        assert!(crate::git::branch_exists(&repo, boxed).unwrap());
+        assert!(box_wt.is_dir());
+        assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
+        drop(running);
+    }
+
     fn state_of(cfg: &crate::config::Config, id: &str) -> String {
         open(&cfg.db_path)
             .unwrap()

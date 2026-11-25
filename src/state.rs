@@ -302,6 +302,8 @@ impl ImplementWorktree {
 pub struct PlanJob {
     pub title: String,
     pub acceptance: String,
+    /// Empty means this job is a leaf. Non-empty means it is a container.
+    pub subjobs: Vec<PlanJob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -936,7 +938,7 @@ fn submit_item_document(
         }
         match_token(item.claim_token.as_deref(), claim_token, item.state)?;
         check_detached(tree, item.state)?;
-        let plan = validate_plan_json(document).map_err(|err| subjobs_conflict(item.state, err))?;
+        let plan = validate_plan_json(document).map_err(|err| depth_conflict(item.state, err))?;
         let now = sql_now(tx)?;
         resolve_points(tx, item_id, &plan.resolved_point_ids, &now)?;
         let next = ItemState::AwaitingPlanReview;
@@ -1081,8 +1083,9 @@ pub fn waive(conn: &mut Connection, item_id: &str, point_id: &str) -> Result<()>
     })
 }
 
-/// Pins `base_sha` and inserts one leaf per plan job.
+/// Pins `base_sha` and inserts the plan's jobs.
 /// An empty `jobs` array becomes one leaf titled with the item title.
+/// A job with subjobs is a container (depth 1) plus leaves (depth 2).
 /// `base_sha` is resolved by the caller; this function does not run git.
 pub fn approve(conn: &mut Connection, item_id: &str, base_sha: &str) -> Result<Vec<String>> {
     if base_sha.is_empty() {
@@ -1107,36 +1110,25 @@ pub fn approve(conn: &mut Connection, item_id: &str, base_sha: &str) -> Result<V
         let Some(plan_json) = item.plan_json.as_deref() else {
             return Err(conflict(item.state, "plan_json is missing"));
         };
-        let plan =
-            validate_plan_json(plan_json).map_err(|err| subjobs_conflict(item.state, err))?;
-        let leaves: Vec<PlanJob> = if plan.jobs.is_empty() {
+        let plan = validate_plan_json(plan_json).map_err(|err| depth_conflict(item.state, err))?;
+        let jobs = if plan.jobs.is_empty() {
             vec![PlanJob {
                 title: item.title.clone(),
                 acceptance: String::new(),
+                subjobs: Vec::new(),
             }]
         } else {
             plan.jobs
         };
         let now = sql_now(tx)?;
-        let mut ids = Vec::with_capacity(leaves.len());
-        for (ord, leaf) in leaves.iter().enumerate() {
-            let job_id = new_id("j")?;
-            tx.execute(
-                "INSERT INTO jobs (
-                    id, item_id, parent_job_id, title, acceptance, state, depth, ord,
-                    base_sha, updated_at
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, 'queued', 1, ?5, ?6, ?7)",
-                params![
-                    job_id,
-                    item_id,
-                    leaf.title,
-                    leaf.acceptance,
-                    ord as i64,
-                    base_sha,
-                    now
-                ],
+        // One counter for every row. Leaf ords stay strictly increasing across
+        // a container, because merge resumes with `ord > integrate_ord`.
+        let mut ord = 0i64;
+        let mut ids = Vec::new();
+        for job in &jobs {
+            insert_plan_job(
+                tx, item_id, None, job, 1, &mut ord, base_sha, &now, &mut ids,
             )?;
-            ids.push(job_id);
         }
         tx.execute(
             "UPDATE items SET
@@ -1754,8 +1746,14 @@ pub(crate) fn merge_facts(
 }
 
 pub(crate) fn job_checkouts(conn: &Connection, item_id: &str) -> Result<Vec<JobGit>> {
+    // Containers are not commits. Their ord must not look like a merged leaf.
     let mut stmt = conn.prepare(
-        "SELECT ord, branch, worktree FROM jobs WHERE item_id = ?1 ORDER BY ord ASC, id ASC",
+        "SELECT ord, branch, worktree FROM jobs
+         WHERE item_id = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM jobs child WHERE child.parent_job_id = jobs.id
+           )
+         ORDER BY ord ASC, id ASC",
     )?;
     let mapped = stmt.query_map(params![item_id], |row| {
         Ok(JobGit {
@@ -1801,32 +1799,7 @@ pub fn validate_plan_json(document: &str) -> Result<PlanDocument> {
                 let job = entry
                     .as_object()
                     .ok_or_else(|| Error::Invalid("job must be an object".into()))?;
-                match job.get("subjobs") {
-                    None => {}
-                    Some(serde_json::Value::Array(nested)) if nested.is_empty() => {}
-                    Some(serde_json::Value::Array(_)) => {
-                        return Err(Error::Invalid(
-                            "plan jobs contain a non-empty subjobs array".into(),
-                        ));
-                    }
-                    Some(_) => return Err(Error::Invalid("subjobs must be an array".into())),
-                }
-                let title = job
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|title| !title.is_empty())
-                    .ok_or_else(|| Error::Invalid("job title is required".into()))?;
-                let acceptance = match job.get("acceptance") {
-                    None => String::new(),
-                    Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(_) => {
-                        return Err(Error::Invalid("acceptance must be a string".into()));
-                    }
-                };
-                jobs.push(PlanJob {
-                    title: title.to_string(),
-                    acceptance,
-                });
+                jobs.push(parse_plan_job(job, 1)?);
             }
             jobs
         }
@@ -1854,11 +1827,93 @@ pub fn validate_plan_json(document: &str) -> Result<PlanDocument> {
     })
 }
 
-fn subjobs_conflict(state: impl AsState, err: Error) -> Error {
-    match err {
-        Error::Invalid(message) if message.contains("non-empty subjobs") => {
-            conflict(state, message)
+fn parse_plan_job(job: &serde_json::Map<String, serde_json::Value>, depth: i64) -> Result<PlanJob> {
+    let title = job
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.is_empty())
+        .ok_or_else(|| Error::Invalid("job title is required".into()))?;
+    let acceptance = match job.get("acceptance") {
+        None => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(_) => return Err(Error::Invalid("acceptance must be a string".into())),
+    };
+    let subjobs = match job.get("subjobs") {
+        None => Vec::new(),
+        // A subjob that itself has children is depth 3. Empty is still a leaf.
+        Some(serde_json::Value::Array(nested)) if depth >= 2 && !nested.is_empty() => {
+            return Err(Error::Invalid("depth 3 is not allowed".into()));
         }
+        Some(serde_json::Value::Array(nested)) => {
+            let mut children = Vec::with_capacity(nested.len());
+            for entry in nested {
+                let child = entry
+                    .as_object()
+                    .ok_or_else(|| Error::Invalid("job must be an object".into()))?;
+                children.push(parse_plan_job(child, depth + 1)?);
+            }
+            children
+        }
+        Some(_) => return Err(Error::Invalid("subjobs must be an array".into())),
+    };
+    Ok(PlanJob {
+        title: title.to_string(),
+        acceptance,
+        subjobs,
+    })
+}
+
+fn insert_plan_job(
+    tx: &Transaction,
+    item_id: &str,
+    parent: Option<&str>,
+    job: &PlanJob,
+    depth: i64,
+    ord: &mut i64,
+    base_sha: &str,
+    now: &str,
+    ids: &mut Vec<String>,
+) -> Result<()> {
+    let job_id = new_id("j")?;
+    let this_ord = *ord;
+    *ord += 1;
+    tx.execute(
+        "INSERT INTO jobs (
+            id, item_id, parent_job_id, title, acceptance, state, depth, ord,
+            base_sha, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
+        params![
+            job_id,
+            item_id,
+            parent,
+            job.title,
+            job.acceptance,
+            depth,
+            this_ord,
+            base_sha,
+            now
+        ],
+    )?;
+    ids.push(job_id.clone());
+    for child in &job.subjobs {
+        insert_plan_job(
+            tx,
+            item_id,
+            Some(&job_id),
+            child,
+            depth + 1,
+            ord,
+            base_sha,
+            now,
+            ids,
+        )?;
+    }
+    Ok(())
+}
+
+fn depth_conflict(state: impl AsState, err: Error) -> Error {
+    match err {
+        Error::Invalid(message) if message.contains("depth 3") => conflict(state, message),
         other => other,
     }
 }
@@ -2834,7 +2889,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_plan_stores_json_and_rejects_subjobs_and_a_dirty_tree() {
+    fn submit_plan_stores_json_and_rejects_depth_three_and_a_dirty_tree() {
         let mut conn = mem();
         let id = item(&mut conn);
         let claim = claim_item(&mut conn, &id, ClaimSpec::daemon("grok:plan", Role::Plan)).unwrap();
@@ -2862,19 +2917,19 @@ mod tests {
         ));
         assert_eq!(state, "planning");
 
-        let nested = r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child"}]}]}"#;
+        let too_deep = r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child","subjobs":[{"title":"no"}]}]}]}"#;
         let err = submit_plan(
             &mut conn,
             &id,
             &claim.token,
-            nested,
+            too_deep,
             DetachedWorktree::unchanged(),
         )
         .unwrap_err();
         match err {
             Error::Conflict { state, message } => {
                 assert_eq!(state, "planning");
-                assert!(message.contains("subjobs"), "{message}");
+                assert!(message.contains("depth 3"), "{message}");
             }
             other => panic!("expected conflict, got {other:?}"),
         }
@@ -2907,19 +2962,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rev, 1);
+        let jobs = approve(&mut conn, &id, "base").unwrap();
+        assert_eq!(jobs.len(), 1);
+        let (depth, parent): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT depth, parent_job_id FROM jobs WHERE id = ?1",
+                params![jobs[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(depth, 1);
+        assert!(parent.is_none());
     }
 
     #[test]
-    fn validate_plan_json_rejects_non_empty_subjobs() {
+    fn validate_plan_json_allows_one_subjob_level_and_rejects_depth_three() {
         let err = validate_plan_json(
             r#"{"jobs":[{"title":"a","subjobs":[{"title":"b","subjobs":[{"title":"c"}]}]}]}"#,
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Invalid(_)));
+        match err {
+            Error::Invalid(message) => assert!(message.contains("depth 3"), "{message}"),
+            other => panic!("expected invalid, got {other:?}"),
+        }
+        let doc = validate_plan_json(
+            r#"{"summary":"s","jobs":[{"title":"box","acceptance":"hold","subjobs":[{"title":"leaf","acceptance":"done"},{"title":"other"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.jobs.len(), 1);
+        assert_eq!(doc.jobs[0].title, "box");
+        assert_eq!(doc.jobs[0].subjobs.len(), 2);
+        assert_eq!(doc.jobs[0].subjobs[0].acceptance, "done");
+        assert!(doc.jobs[0].subjobs[1].subjobs.is_empty());
         let doc = validate_plan_json(r#"{"summary":"s","jobs":[]}"#).unwrap();
         assert!(doc.jobs.is_empty());
         assert_eq!(doc.summary, "s");
         let err = validate_plan_json(r#"{"jobs":[{}]}"#).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
+        let err = validate_plan_json(r#"{"jobs":[{"title":"t","subjobs":{}}]}"#).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)));
         assert!(validate_plan_json(&"x".repeat(DOC_MAX + 1)).is_err());
     }
@@ -3025,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn approve_inserts_a_leaf_and_refuses_skips_open_points_and_subjobs() {
+    fn approve_inserts_a_leaf_and_refuses_skips_open_points_and_depth_three() {
         let mut conn = mem();
         let bare = create_item(&mut conn, intake(false)).unwrap();
         let (state, _) = conflict_of(approve(&mut conn, &bare, "abc").map(|_| ()));
@@ -3069,13 +3149,16 @@ mod tests {
         conn.execute(
             "UPDATE items SET plan_json = ?1 WHERE id = ?2",
             params![
-                r#"{"jobs":[{"title":"t","subjobs":[{"title":"nested"}]}]}"#,
+                r#"{"jobs":[{"title":"t","subjobs":[{"title":"nested","subjobs":[{"title":"no"}]}]}]}"#,
                 id
             ],
         )
         .unwrap();
         let err = approve(&mut conn, &id, "abc").unwrap_err();
-        assert!(matches!(err, Error::Conflict { .. }));
+        match err {
+            Error::Conflict { message, .. } => assert!(message.contains("depth 3"), "{message}"),
+            other => panic!("expected conflict, got {other:?}"),
+        }
         assert_eq!(item_state(&mut conn, &id), "awaiting_plan_review");
 
         conn.execute(
@@ -3212,6 +3295,139 @@ mod tests {
         assert_eq!(item_state(&mut conn, &id), "awaiting_merge");
         assert_eq!(job_state(&mut conn, &jobs[0]), "accepted");
         assert_eq!(job_state(&mut conn, &jobs[1]), "accepted");
+    }
+
+    #[test]
+    fn depth_two_approve_claims_only_leaves_and_merge_skips_the_container() {
+        let mut conn = mem();
+        let id = item(&mut conn);
+        let claim = claim_item(&mut conn, &id, ClaimSpec::daemon("grok:plan", Role::Plan)).unwrap();
+        let document = r#"{"summary":"nested","jobs":[
+            {"title":"first","acceptance":"a"},
+            {"title":"box","acceptance":"hold","subjobs":[
+                {"title":"left","acceptance":"L"},
+                {"title":"right","acceptance":"R"}
+            ]},
+            {"title":"last","acceptance":"z"}
+        ]}"#;
+        submit_plan(
+            &mut conn,
+            &id,
+            &claim.token,
+            document,
+            DetachedWorktree::unchanged(),
+        )
+        .unwrap();
+        let jobs = approve(&mut conn, &id, "base-sha").unwrap();
+        assert_eq!(jobs.len(), 5);
+        let rows: Vec<(String, Option<String>, i64, i64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, parent_job_id, depth, ord, title FROM jobs
+                     WHERE item_id = ?1 ORDER BY ord",
+                )
+                .unwrap();
+            let mapped = stmt
+                .query_map(params![id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap();
+            mapped.map(|row| row.unwrap()).collect()
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.4.as_str(), row.2, row.3))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first", 1, 0),
+                ("box", 1, 1),
+                ("left", 2, 2),
+                ("right", 2, 3),
+                ("last", 1, 4),
+            ]
+        );
+        let box_id = rows[1].0.clone();
+        assert!(rows[2].1.as_deref() == Some(box_id.as_str()));
+        assert!(rows[3].1.as_deref() == Some(box_id.as_str()));
+        assert!(rows[0].1.is_none());
+        let (state, message) = conflict_of(
+            claim_job(
+                &mut conn,
+                &box_id,
+                ClaimSpec::daemon("grok:impl", Role::Implement),
+            )
+            .map(|_| ()),
+        );
+        assert_eq!(state, "queued");
+        assert!(message.contains("container"), "{message}");
+
+        let leaves = [
+            rows[0].0.clone(),
+            rows[2].0.clone(),
+            rows[3].0.clone(),
+            rows[4].0.clone(),
+        ];
+        for (index, leaf) in leaves.iter().enumerate() {
+            let claim = claim_job(
+                &mut conn,
+                leaf,
+                ClaimSpec::daemon(&format!("grok:impl{index}"), Role::Implement),
+            )
+            .unwrap();
+            submit_implement(
+                &mut conn,
+                leaf,
+                &claim.token,
+                &format!("sha-{index}"),
+                ImplementWorktree::ready(),
+            )
+            .unwrap();
+            let review = claim_job(
+                &mut conn,
+                leaf,
+                ClaimSpec::daemon(&format!("claude:r{index}"), Role::Review),
+            )
+            .unwrap();
+            submit_review(
+                &mut conn,
+                leaf,
+                &review.token,
+                REVIEW,
+                DetachedWorktree::unchanged(),
+            )
+            .unwrap();
+        }
+        accept_job(&mut conn, &leaves[1]).unwrap();
+        assert_eq!(job_state(&mut conn, &box_id), "queued");
+        assert_eq!(item_state(&mut conn, &id), "implementing");
+        accept_job(&mut conn, &leaves[2]).unwrap();
+        assert_eq!(job_state(&mut conn, &box_id), "accepted");
+        assert_eq!(item_state(&mut conn, &id), "implementing");
+        accept_job(&mut conn, &leaves[0]).unwrap();
+        assert_eq!(item_state(&mut conn, &id), "implementing");
+        accept_job(&mut conn, &leaves[3]).unwrap();
+        assert_eq!(item_state(&mut conn, &id), "awaiting_merge");
+
+        let (_facts, merged) = merge_facts(&mut conn, &id).unwrap();
+        let ords: Vec<(String, i64)> = merged
+            .iter()
+            .map(|leaf| (leaf.id.clone(), leaf.ord))
+            .collect();
+        assert_eq!(
+            ords,
+            vec![
+                (leaves[0].clone(), 0),
+                (leaves[1].clone(), 2),
+                (leaves[2].clone(), 3),
+                (leaves[3].clone(), 4),
+            ]
+        );
     }
 
     #[test]
