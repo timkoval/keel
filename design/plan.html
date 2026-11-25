@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'">
+<title>{{title}}</title>
+<style>
+{{tokens}}
+</style>
+</head>
+<body>
+<header class="top">
+  <span class="brand">keel</span>
+  <span class="mono id">{{item_id}}</span>
+  <span class="chip">{{state}}</span>
+  <span class="mono dim">r{{rev}}</span>
+</header>
+<main>
+  <h1>{{title}}</h1>
+  <pre class="body">{{summary}}</pre>
+  <h2>sections</h2>
+{{sections}}
+  <h2>open points</h2>
+  <ul class="points">
+{{points}}
+  </ul>
+  <h2>jobs</h2>
+  <ul class="jobs">
+{{jobs}}
+  </ul>
+  <p class="dim">previous {{previous}}</p>
+</main>
+<script type="application/json" id="keel-doc">{{doc}}</script>
+</body>
+</html>

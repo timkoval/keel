@@ -16,13 +16,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::claim::{self, Target};
 use crate::config::Config;
 use crate::db::{open, Error, Result};
 use crate::http::{self, Request, Response};
-use crate::render::{self, CardView, PointView, QueueLink, QueueView};
+use crate::render::{
+    self, CardView, PlanJobView, PlanSection, PlanView, PointView, QueueLink, QueueView,
+};
 use crate::state::{self, RawIntake};
 
 const LOCK_EX: i32 = 2;
@@ -271,7 +273,10 @@ fn action_route(path: &str) -> Option<(Target, &str, &str)> {
     if parts.next().is_some() || !render::safe_id(id) {
         return None;
     }
-    if !matches!(action, "claim" | "heartbeat" | "release") {
+    if !matches!(
+        action,
+        "claim" | "heartbeat" | "release" | "note" | "waive" | "approve" | "drop" | "submit"
+    ) {
         return None;
     }
     Some((target, id, action))
@@ -340,8 +345,26 @@ fn mutate_response(
                 Err(err) => fail(err),
             }
         }
+        "note" => item_action(target, action, || note_response(shared, id, req)),
+        "waive" => item_action(target, action, || {
+            waive_response(shared, id, req, surface_cli)
+        }),
+        "approve" => item_action(target, action, || {
+            approve_response(shared, id, req, surface_cli)
+        }),
+        "drop" => item_action(target, action, || {
+            drop_response(shared, id, req, surface_cli)
+        }),
+        "submit" => item_action(target, action, || submit_response(shared, id, req)),
         _ => missing(action),
     }
+}
+
+fn item_action(target: Target, action: &str, call: impl FnOnce() -> Response) -> Response {
+    if target != Target::Item {
+        return fail(Error::Invalid(format!("{action} is an item route")));
+    }
+    call()
 }
 
 fn resolve_response(shared: &Shared, id: Option<&str>) -> Response {
@@ -373,8 +396,9 @@ fn route_tcp(req: &Request, shared: &Shared) -> Response {
         "/health" => Response::json(200, json!({ "ok": true })),
         "/queue/plan-review" => queue_response(shared, QueueKind::Plan),
         "/queue/feedback" => queue_response(shared, QueueKind::Feedback),
-        other => match card_id(other) {
-            Some(id) => card_response(shared, id),
+        other => match doc_route(other) {
+            Some(Doc::Card(id)) => card_response(shared, id),
+            Some(Doc::Plan { id, rev }) => plan_response(shared, id, rev),
             None => missing(other),
         },
     }
@@ -584,18 +608,7 @@ fn load_card(conn: &Connection, id: &str) -> Result<CardView> {
     let Some(mut card) = row else {
         return Err(Error::NotFound(id.to_string()));
     };
-    let mut stmt =
-        conn.prepare("SELECT id, text, status FROM open_points WHERE item_id = ?1 ORDER BY id")?;
-    let points = stmt.query_map(params![id], |row| {
-        Ok(PointView {
-            id: row.get(0)?,
-            text: row.get(1)?,
-            status: row.get(2)?,
-        })
-    })?;
-    for point in points {
-        card.open_points.push(point?);
-    }
+    card.open_points = load_points(conn, id)?;
     Ok(card)
 }
 
@@ -805,13 +818,528 @@ fn load_queue(conn: &Connection, config: &Config, kind: QueueKind) -> Result<Que
     }
 }
 
-fn card_id(path: &str) -> Option<&str> {
+enum Doc<'a> {
+    Card(&'a str),
+    Plan { id: &'a str, rev: Option<i64> },
+}
+
+fn doc_route(path: &str) -> Option<Doc<'_>> {
     let rest = path.strip_prefix("/i/")?;
-    let (id, tail) = rest.split_once('/')?;
-    if tail == "card" && render::safe_id(id) {
-        Some(id)
+    let mut parts = rest.split('/');
+    let id = parts.next()?;
+    if !render::safe_id(id) {
+        return None;
+    }
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("card"), None, None, None) => Some(Doc::Card(id)),
+        (Some("plan"), None, None, None) => Some(Doc::Plan { id, rev: None }),
+        (Some("plan"), Some("r"), Some(rev), None) => {
+            let rev = parse_rev(rev)?;
+            Some(Doc::Plan { id, rev: Some(rev) })
+        }
+        _ => None,
+    }
+}
+
+fn parse_rev(text: &str) -> Option<i64> {
+    if text.is_empty() || text.len() > 9 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let rev = text.parse().ok()?;
+    if rev < 1 {
+        None
+    } else {
+        Some(rev)
+    }
+}
+
+fn note_response(shared: &Shared, id: &str, req: &Request) -> Response {
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let text = match required_string(&obj, "text") {
+        Ok(text) => text,
+        Err(err) => return fail(err),
+    };
+    let noted = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match state::note(&mut conn, id, &text) {
+            Ok(point_id) => match read_item_state(&conn, id) {
+                Ok(state_name) => Ok((point_id, state_name)),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        }
+    };
+    match noted {
+        Ok((point_id, state_name)) => finish_plan(
+            shared,
+            id,
+            json!({
+                "id": id,
+                "point_id": point_id,
+                "state": state_name,
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn waive_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let point_id = match required_string(&obj, "point_id") {
+        Ok(point_id) => point_id,
+        Err(err) => return fail(err),
+    };
+    let waived = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match state::waive(&mut conn, id, &point_id) {
+            Ok(()) => read_item_state(&conn, id),
+            Err(err) => Err(err),
+        }
+    };
+    match waived {
+        Ok(state_name) => finish_plan(
+            shared,
+            id,
+            json!({
+                "id": id,
+                "point_id": point_id,
+                "state": state_name,
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn approve_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    // No git in this slice. The caller passes the sha `approve` pins.
+    let base_sha = match required_string(&obj, "base_sha") {
+        Ok(base_sha) => base_sha,
+        Err(err) => return fail(err),
+    };
+    let approved = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match state::approve(&mut conn, id, &base_sha) {
+            Ok(job_ids) => match read_item_state(&conn, id) {
+                Ok(state_name) => Ok((job_ids, state_name)),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        }
+    };
+    match approved {
+        Ok((job_ids, state_name)) => finish_plan(
+            shared,
+            id,
+            json!({
+                "id": id,
+                "state": state_name,
+                "base_sha": base_sha,
+                "job_ids": job_ids,
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn drop_response(shared: &Shared, id: &str, req: &Request, surface_cli: bool) -> Response {
+    if let Err(err) = require_cli(surface_cli) {
+        return fail(err);
+    }
+    let obj = match json_object_or_empty(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    // `--force` is only the state-machine flag. This slice has no child to signal.
+    let force = match optional_bool(&obj, "force") {
+        Ok(force) => force,
+        Err(err) => return fail(err),
+    };
+    let dropped = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match state::drop_item(&mut conn, id, force) {
+            Ok(()) => read_item_state(&conn, id),
+            Err(err) => Err(err),
+        }
+    };
+    match dropped {
+        Ok(state_name) => Response::json(
+            200,
+            json!({
+                "id": id,
+                "state": state_name,
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn submit_response(shared: &Shared, id: &str, req: &Request) -> Response {
+    let obj = match json_object(&req.body) {
+        Ok(obj) => obj,
+        Err(err) => return fail(err),
+    };
+    let token = match required_string(&obj, "claim_token") {
+        Ok(token) if token.is_empty() => {
+            return fail(Error::Invalid("claim_token is empty".into()));
+        }
+        Ok(token) => token,
+        Err(err) => return fail(err),
+    };
+    let Some(document_value) = obj.get("document") else {
+        return fail(Error::Invalid("document is required".into()));
+    };
+    let document = match document_text(document_value) {
+        Ok(document) => document,
+        Err(err) => return fail(err),
+    };
+    let submitted = {
+        let mut conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        // There is no worktree until a later PR, so the detached tree is the clean fixture.
+        let tree = state::DetachedWorktree::unchanged();
+        let result = match read_item_state(&conn, id) {
+            Ok(state_name) => match state_name.as_str() {
+                "planning" => state::submit_plan(&mut conn, id, &token, &document, tree),
+                "revising" => state::submit_revision(&mut conn, id, &token, &document, tree),
+                _ => Err(Error::Conflict {
+                    state: state_name,
+                    message: "submit requires planning or revising".into(),
+                }),
+            },
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => read_plan_rev(&conn, id),
+            Err(err) => Err(err),
+        }
+    };
+    match submitted {
+        Ok((state_name, rev)) => finish_plan(
+            shared,
+            id,
+            json!({
+                "id": id,
+                "state": state_name,
+                "plan_rev": rev,
+                "plan_url": shared.config.plan_url(id),
+            }),
+        ),
+        Err(err) => fail(err),
+    }
+}
+
+fn finish_plan(shared: &Shared, id: &str, mut body: Value) -> Response {
+    if let Err(err) = publish_plan(shared, id) {
+        body["warning"] = json!(format!("plan was not written: {err}"));
+    }
+    Response::json(200, body)
+}
+
+fn plan_response(shared: &Shared, id: &str, rev: Option<i64>) -> Response {
+    let current = {
+        let conn = match lock_db(&shared.db) {
+            Ok(conn) => conn,
+            Err(err) => return fail(err),
+        };
+        match read_plan_rev(&conn, id) {
+            Ok((_, rev)) => rev,
+            Err(err) => return fail(err),
+        }
+    };
+    // `plan_rev` 0 means the column has never been written.
+    if current < 1 {
+        return missing(&format!("{id}/plan"));
+    }
+    let rev = rev.unwrap_or(current);
+    let path = plan_file(shared, id, rev);
+    if rev == current {
+        if path.is_file() {
+            let _ = set_plan_relpath(shared, id, current);
+        } else if let Err(err) = publish_plan(shared, id) {
+            return fail(err);
+        }
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => Response::html(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => missing(&format!("plan r{rev}")),
+        Err(err) => fail(err.into()),
+    }
+}
+
+fn plan_file(shared: &Shared, id: &str, rev: i64) -> PathBuf {
+    shared
+        .config
+        .docs_dir
+        .join(id)
+        .join("plan")
+        .join(format!("r{rev}.html"))
+}
+
+/// Same path as the card: canonical file, then a best-effort artifact copy.
+/// Only the current revision is published. Older `rN` files stay where submit wrote them.
+fn publish_plan(shared: &Shared, id: &str) -> Result<()> {
+    if !render::safe_id(id) {
+        return Err(Error::NotFound(id.to_string()));
+    }
+    let plan = {
+        let conn = lock_db(&shared.db)?;
+        match load_plan(&conn, id, &shared.config)? {
+            Some(plan) => plan,
+            None => return Ok(()),
+        }
+    };
+    let html = render::plan_page(&plan);
+    let canonical = plan_file(shared, &plan.id, plan.plan_rev);
+    // The database lock is not held across the disk write.
+    write_atomic(&canonical, html.as_bytes())?;
+    // The file is durable. A failed column update is repaired on the next plan read.
+    if let Err(err) = set_plan_relpath(shared, &plan.id, plan.plan_rev) {
+        eprintln!("keel: plan {} relpath not recorded: {err}", plan.id);
+    }
+    let published = shared
+        .config
+        .publish_root
+        .join("keel")
+        .join(&plan.id)
+        .join("plan.html");
+    // The artifact copy is best-effort. The canonical file is the record.
+    if let Err(err) = write_atomic(&published, html.as_bytes()) {
+        eprintln!("keel: publish plan {} failed: {err}", plan.id);
+    }
+    Ok(())
+}
+
+fn load_plan(conn: &Connection, id: &str, config: &Config) -> Result<Option<PlanView>> {
+    let row = conn
+        .query_row(
+            "SELECT id, title, state, summary, plan_rev, plan_json, updated_at
+             FROM items WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((item_id, title, state_name, _summary, plan_rev, plan_json, updated_at)) = row else {
+        return Err(Error::NotFound(id.to_string()));
+    };
+    let Some(plan_json) = plan_json.filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    if plan_rev < 1 {
+        return Ok(None);
+    }
+    let document = state::validate_plan_json(&plan_json)?;
+    let db_jobs = load_job_views(conn, id)?;
+    let jobs = if db_jobs.is_empty() {
+        document
+            .jobs
+            .into_iter()
+            .map(|job| PlanJobView {
+                id: None,
+                parent_id: None,
+                title: job.title,
+                acceptance: job.acceptance,
+            })
+            .collect()
+    } else {
+        db_jobs
+    };
+    let previous_url = if plan_rev > 1 {
+        Some(config.plan_rev_url(id, plan_rev - 1))
     } else {
         None
+    };
+    Ok(Some(PlanView {
+        id: item_id,
+        title,
+        state: state_name,
+        summary: document.summary,
+        plan_rev,
+        updated_at,
+        previous_url,
+        open_points: load_points(conn, id)?,
+        sections: sections_of(&plan_json),
+        jobs,
+    }))
+}
+
+fn sections_of(document: &str) -> Vec<PlanSection> {
+    let Ok(value) = serde_json::from_str::<Value>(document) else {
+        return Vec::new();
+    };
+    let Some(list) = value.get("sections").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut sections = Vec::new();
+    for entry in list {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let heading = obj
+            .get("heading")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let body = obj
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if heading.is_empty() && body.is_empty() {
+            continue;
+        }
+        sections.push(PlanSection { heading, body });
+    }
+    sections
+}
+
+fn load_points(conn: &Connection, id: &str) -> Result<Vec<PointView>> {
+    let mut stmt =
+        conn.prepare("SELECT id, text, status FROM open_points WHERE item_id = ?1 ORDER BY id")?;
+    let points = stmt.query_map(params![id], |row| {
+        Ok(PointView {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            status: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for point in points {
+        out.push(point?);
+    }
+    Ok(out)
+}
+
+fn load_job_views(conn: &Connection, id: &str) -> Result<Vec<PlanJobView>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_job_id, title, acceptance
+         FROM jobs WHERE item_id = ?1 ORDER BY ord, id",
+    )?;
+    let rows = stmt.query_map(params![id], |row| {
+        Ok(PlanJobView {
+            id: row.get(0)?,
+            parent_id: row.get(1)?,
+            title: row.get(2)?,
+            acceptance: row.get(3)?,
+        })
+    })?;
+    let mut jobs = Vec::new();
+    for job in rows {
+        jobs.push(job?);
+    }
+    Ok(jobs)
+}
+
+fn read_item_state(conn: &Connection, id: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT state FROM items WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
+}
+
+fn read_plan_rev(conn: &Connection, id: &str) -> Result<(String, i64)> {
+    conn.query_row(
+        "SELECT state, plan_rev FROM items WHERE id = ?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
+}
+
+fn set_plan_relpath(shared: &Shared, id: &str, rev: i64) -> Result<()> {
+    let rel = format!("docs/{id}/plan/r{rev}.html");
+    let conn = lock_db(&shared.db)?;
+    conn.execute(
+        "UPDATE items SET plan_relpath = ?1 WHERE id = ?2 AND plan_relpath IS NOT ?1",
+        params![rel, id],
+    )?;
+    Ok(())
+}
+
+fn require_cli(surface_cli: bool) -> Result<()> {
+    if surface_cli {
+        Ok(())
+    } else {
+        Err(Error::Invalid("this route is cli only".into()))
+    }
+}
+
+fn json_object(body: &[u8]) -> Result<Map<String, Value>> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|err| Error::Invalid(format!("json: {err}")))?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| Error::Invalid("expected a JSON object".into()))
+}
+
+fn json_object_or_empty(body: &[u8]) -> Result<Map<String, Value>> {
+    if body.is_empty() {
+        return Ok(Map::new());
+    }
+    json_object(body)
+}
+
+fn document_text(value: &Value) -> Result<String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Object(_) => {
+            serde_json::to_string(value).map_err(|err| Error::Invalid(format!("document: {err}")))
+        }
+        _ => Err(Error::Invalid(
+            "document must be a JSON object or a JSON string".into(),
+        )),
+    }
+}
+
+fn optional_bool(obj: &Map<String, Value>, key: &str) -> Result<bool> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(Error::Invalid(format!("{key} must be a boolean"))),
     }
 }
 
@@ -1687,6 +2215,627 @@ mod tests {
         let missing = api(&cfg, "GET", "/v1/resolve?id=nope", None);
         assert_eq!(missing.status, 404);
         drop(running);
+    }
+
+    fn tcp_with(
+        cfg: &Config,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut stream = TcpStream::connect(("127.0.0.1", cfg.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        http::exchange_with(&mut stream, method, path, body, headers).unwrap()
+    }
+
+    fn claim_role(cfg: &Config, id: &str, role: &str) -> String {
+        let claimed = post(
+            cfg,
+            &format!("/v1/items/{id}/claim"),
+            json!({"role": role, "adapter": "cli", "worker_id": format!("cli:{role}")}),
+        );
+        assert_eq!(
+            claimed.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&claimed.body)
+        );
+        let claimed: Value = serde_json::from_slice(&claimed.body).unwrap();
+        claimed["claim_token"].as_str().unwrap().to_string()
+    }
+
+    fn item_state_of(cfg: &Config, id: &str) -> String {
+        open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn note_waive_revise_approve_and_drop() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        let created = api(
+            &cfg,
+            "POST",
+            "/v1/items",
+            Some(
+                json!({
+                    "source": "cli",
+                    "title": "Pin <walk>",
+                    "body": "body",
+                    "repo": "/tmp/repo",
+                    "target_branch": "main",
+                })
+                .to_string()
+                .as_bytes(),
+            ),
+        );
+        assert_eq!(
+            created.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&created.body)
+        );
+        let created: Value = serde_json::from_slice(&created.body).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let early = tcp(&cfg, "GET", &format!("/i/{id}/plan"), None);
+        assert_eq!(early.status, 404);
+
+        let token = claim_role(&cfg, &id, "plan");
+        let document = r#"{"summary":"Pin </script>","jobs":[{"title":"Walk","acceptance":"listed"}],"sections":[{"heading":"Scope <a>","body":"no twin"}]}"#;
+        let submitted = post(
+            &cfg,
+            &format!("/v1/items/{id}/submit"),
+            json!({"claim_token": token, "document": document}),
+        );
+        assert_eq!(
+            submitted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&submitted.body)
+        );
+        let submitted: Value = serde_json::from_slice(&submitted.body).unwrap();
+        assert_eq!(submitted["state"], "awaiting_plan_review");
+        assert_eq!(submitted["plan_rev"], 1);
+        assert_eq!(submitted["plan_url"], cfg.plan_url(&id));
+        let stored: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT plan_json FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, document);
+        let rel: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT plan_relpath FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rel, format!("docs/{id}/plan/r1.html"));
+
+        let canonical = cfg.docs_dir.join(&id).join("plan").join("r1.html");
+        let published = cfg.publish_root.join("keel").join(&id).join("plan.html");
+        let html = fs::read_to_string(&canonical).unwrap();
+        assert_eq!(html, fs::read_to_string(&published).unwrap());
+        assert!(!cfg.docs_dir.join(&id).join("plan.md").exists());
+        assert!(!published.with_extension("md").exists());
+        assert_eq!(html.matches("</script>").count(), 1);
+        assert!(html.contains("Pin &lt;/script&gt;"));
+        assert!(html.contains("Scope &lt;a&gt;"));
+        assert!(html.contains("no twin"));
+        assert!(html.contains("script-src 'none'"));
+        assert!(!html.to_ascii_lowercase().contains("<button"));
+        assert!(!html.to_ascii_lowercase().contains("<form"));
+        let doc = keel_doc(&html);
+        assert_eq!(doc["keel"], 1);
+        assert_eq!(doc["kind"], "plan");
+        assert_eq!(doc["item_id"], id);
+        assert!(doc["job_id"].is_null());
+        assert_eq!(doc["rev"], 1);
+        assert_eq!(doc["summary"], "Pin </script>");
+        assert_eq!(doc["jobs"][0]["title"], "Walk");
+        assert!(doc["jobs"][0]["id"].is_null());
+        assert!(doc["diff"].is_null());
+
+        fs::remove_file(&canonical).unwrap();
+        let repaired = tcp(&cfg, "GET", &format!("/i/{id}/plan"), None);
+        assert_eq!(repaired.status, 200);
+        assert_eq!(repaired.body, fs::read(&canonical).unwrap());
+        let old = tcp(&cfg, "GET", &format!("/i/{id}/plan/r/1"), None);
+        assert_eq!(old.status, 200);
+
+        let not_held = post(
+            &cfg,
+            &format!("/v1/items/{id}/submit"),
+            json!({
+                "claim_token": "stale",
+                "document": r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child"}]}]}"#,
+            }),
+        );
+        assert_eq!(
+            not_held.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&not_held.body)
+        );
+        assert!(String::from_utf8_lossy(&not_held.body).contains("planning"));
+        assert_eq!(item_state_of(&cfg, &id), "awaiting_plan_review");
+
+        let first = post(
+            &cfg,
+            &format!("/v1/items/{id}/note"),
+            json!({"text": "first"}),
+        );
+        assert_eq!(
+            first.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&first.body)
+        );
+        let first: Value = serde_json::from_slice(&first.body).unwrap();
+        let first_id = first["point_id"].as_str().unwrap().to_string();
+        assert_eq!(first["state"], "revision_requested");
+        let second = post(
+            &cfg,
+            &format!("/v1/items/{id}/note"),
+            json!({"text": "second"}),
+        );
+        let second: Value = serde_json::from_slice(&second.body).unwrap();
+        let second_id = second["point_id"].as_str().unwrap().to_string();
+        let bare_waive = post(
+            &cfg,
+            &format!("/v1/items/{id}/waive"),
+            json!({"point_id": first_id}),
+        );
+        assert_eq!(bare_waive.status, 400);
+        let waived = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/waive"),
+            json!({"point_id": first_id}),
+        );
+        assert_eq!(
+            waived.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&waived.body)
+        );
+        let waived: Value = serde_json::from_slice(&waived.body).unwrap();
+        assert_eq!(waived["state"], "revision_requested");
+        let last = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/waive"),
+            json!({"point_id": second_id}),
+        );
+        let last: Value = serde_json::from_slice(&last.body).unwrap();
+        assert_eq!(last["state"], "awaiting_plan_review");
+
+        let keep = post(
+            &cfg,
+            &format!("/v1/items/{id}/note"),
+            json!({"text": "keep"}),
+        );
+        let keep: Value = serde_json::from_slice(&keep.body).unwrap();
+        let keep_id = keep["point_id"].as_str().unwrap().to_string();
+        let mid_point = post(
+            &cfg,
+            &format!("/v1/items/{id}/note"),
+            json!({"text": "mid"}),
+        );
+        let mid_point: Value = serde_json::from_slice(&mid_point.body).unwrap();
+        let mid_id = mid_point["point_id"].as_str().unwrap().to_string();
+        let fix = post(
+            &cfg,
+            &format!("/v1/items/{id}/note"),
+            json!({"text": "fix"}),
+        );
+        let fix: Value = serde_json::from_slice(&fix.body).unwrap();
+        let fix_id = fix["point_id"].as_str().unwrap().to_string();
+        assert_eq!(item_state_of(&cfg, &id), "revision_requested");
+        let token = claim_role(&cfg, &id, "revise");
+        assert_eq!(item_state_of(&cfg, &id), "revising");
+        let mid = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/waive"),
+            json!({"point_id": mid_id}),
+        );
+        let mid: Value = serde_json::from_slice(&mid.body).unwrap();
+        assert_eq!(mid["state"], "revising");
+        let missing_point = post(
+            &cfg,
+            &format!("/v1/items/{id}/submit"),
+            json!({
+                "claim_token": token,
+                "document": r#"{"summary":"nope","jobs":[],"resolved_point_ids":["p_missing"]}"#,
+            }),
+        );
+        assert_eq!(missing_point.status, 400);
+        assert_eq!(item_state_of(&cfg, &id), "revising");
+        let rev: i64 = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT plan_rev FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rev, 1);
+        let revised = format!(
+            r#"{{"summary":"revised","jobs":[{{"title":"Walk","acceptance":"listed"}}],"resolved_point_ids":["{fix_id}"]}}"#
+        );
+        let submitted = post(
+            &cfg,
+            &format!("/v1/items/{id}/submit"),
+            json!({"claim_token": token, "document": revised}),
+        );
+        assert_eq!(
+            submitted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&submitted.body)
+        );
+        let submitted: Value = serde_json::from_slice(&submitted.body).unwrap();
+        assert_eq!(submitted["state"], "awaiting_plan_review");
+        assert_eq!(submitted["plan_rev"], 2);
+        let fix_status: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM open_points WHERE id = ?1",
+                params![fix_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fix_status, "resolved");
+        let keep_status: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM open_points WHERE id = ?1",
+                params![keep_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_status, "open");
+        let open_blocked = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/approve"),
+            json!({"base_sha": "fixture-base"}),
+        );
+        assert_eq!(
+            open_blocked.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&open_blocked.body)
+        );
+        assert!(String::from_utf8_lossy(&open_blocked.body).contains("open"));
+        let cleared_keep = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/waive"),
+            json!({"point_id": keep_id}),
+        );
+        let cleared_keep: Value = serde_json::from_slice(&cleared_keep.body).unwrap();
+        assert_eq!(cleared_keep["state"], "awaiting_plan_review");
+        let current = tcp(&cfg, "GET", &format!("/i/{id}/plan"), None);
+        let current_html = String::from_utf8(current.body).unwrap();
+        assert!(current_html.contains("revised"));
+        assert!(current_html.contains("/plan/r/1"));
+        let r1 = fs::read_to_string(cfg.docs_dir.join(&id).join("plan").join("r1.html")).unwrap();
+        assert!(r1.contains("Pin &lt;/script&gt;"));
+        assert!(!r1.contains("revised"));
+        let token_after: Option<String> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_token FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(token_after.is_none());
+
+        let block = post(
+            &cfg,
+            &format!("/v1/items/{id}/note"),
+            json!({"text": "block"}),
+        );
+        let block: Value = serde_json::from_slice(&block.body).unwrap();
+        let block_id = block["point_id"].as_str().unwrap().to_string();
+        assert_eq!(block["state"], "revision_requested");
+        let noted_html =
+            fs::read_to_string(cfg.docs_dir.join(&id).join("plan").join("r2.html")).unwrap();
+        assert!(noted_html.contains("block"));
+        let blocked = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/approve"),
+            json!({"base_sha": "fixture-base"}),
+        );
+        assert_eq!(
+            blocked.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&blocked.body)
+        );
+        let cleared = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/waive"),
+            json!({"point_id": block_id}),
+        );
+        let cleared: Value = serde_json::from_slice(&cleared.body).unwrap();
+        assert_eq!(cleared["state"], "awaiting_plan_review");
+        let sneaky = post(
+            &cfg,
+            &format!("/v1/items/{id}/approve"),
+            json!({"base_sha": "fixture-base"}),
+        );
+        assert_eq!(sneaky.status, 400);
+        assert_eq!(item_state_of(&cfg, &id), "awaiting_plan_review");
+        let approved = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/approve"),
+            json!({"base_sha": "fixture-base"}),
+        );
+        assert_eq!(
+            approved.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&approved.body)
+        );
+        let approved: Value = serde_json::from_slice(&approved.body).unwrap();
+        assert_eq!(approved["state"], "awaiting_implementation");
+        assert_eq!(approved["base_sha"], "fixture-base");
+        let job_id = approved["job_ids"][0].as_str().unwrap().to_string();
+        assert!(approved["job_ids"].as_array().unwrap().len() == 1);
+        let (job_title, job_base, job_state): (String, String, String) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT title, base_sha, state FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(job_title, "Walk");
+        assert_eq!(job_base, "fixture-base");
+        assert_eq!(job_state, "queued");
+        let item_base: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT base_sha FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_base, "fixture-base");
+        let planned = keel_doc(
+            &fs::read_to_string(cfg.docs_dir.join(&id).join("plan").join("r2.html")).unwrap(),
+        );
+        assert_eq!(planned["jobs"][0]["id"], job_id);
+        assert_eq!(planned["jobs"][0]["title"], "Walk");
+        assert_eq!(planned["state"], "awaiting_implementation");
+
+        let tcp_drop = tcp_with(
+            &cfg,
+            "POST",
+            &format!("/v1/items/{id}/drop"),
+            Some(br#"{"force":true}"#),
+            &[("x-keel-surface", "cli")],
+        );
+        assert_eq!(tcp_drop.status, 405);
+        assert_eq!(item_state_of(&cfg, &id), "awaiting_implementation");
+        let dropped = post_cli(
+            &cfg,
+            &format!("/v1/items/{id}/drop"),
+            json!({"force": false}),
+        );
+        assert_eq!(
+            dropped.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&dropped.body)
+        );
+        assert_eq!(item_state_of(&cfg, &id), "dropped");
+        let job_state: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_state, "cancelled");
+
+        let bare = post_item(&cfg, "No repo", "body");
+        let bare_id = bare["id"].as_str().unwrap();
+        let token = claim_role(&cfg, bare_id, "plan");
+        let submitted = post(
+            &cfg,
+            &format!("/v1/items/{bare_id}/submit"),
+            json!({"claim_token": token, "document": {"summary":"s","jobs":[{"title":"T","acceptance":""}]}}),
+        );
+        assert_eq!(
+            submitted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&submitted.body)
+        );
+        let refused = post_cli(
+            &cfg,
+            &format!("/v1/items/{bare_id}/approve"),
+            json!({"base_sha": "fixture-base"}),
+        );
+        assert_eq!(
+            refused.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert!(String::from_utf8_lossy(&refused.body).contains("repo"));
+
+        let empty = api(
+            &cfg,
+            "POST",
+            "/v1/items",
+            Some(
+                json!({
+                    "source": "cli",
+                    "title": "One leaf",
+                    "body": "",
+                    "repo": "/tmp/repo",
+                    "target_branch": "main",
+                })
+                .to_string()
+                .as_bytes(),
+            ),
+        );
+        let empty: Value = serde_json::from_slice(&empty.body).unwrap();
+        let empty_id = empty["id"].as_str().unwrap();
+        let token = claim_role(&cfg, empty_id, "plan");
+        let submitted = post(
+            &cfg,
+            &format!("/v1/items/{empty_id}/submit"),
+            json!({"claim_token": token, "document": {"summary":"solo","jobs":[]}}),
+        );
+        assert_eq!(
+            submitted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&submitted.body)
+        );
+        let approved = post_cli(
+            &cfg,
+            &format!("/v1/items/{empty_id}/approve"),
+            json!({"base_sha": "fixture-empty"}),
+        );
+        assert_eq!(
+            approved.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&approved.body)
+        );
+        let approved: Value = serde_json::from_slice(&approved.body).unwrap();
+        let leaf = approved["job_ids"][0].as_str().unwrap();
+        let leaf_title: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT title FROM jobs WHERE id = ?1",
+                params![leaf],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaf_title, "One leaf");
+
+        let nested_item = post_item(&cfg, "Nested", "body");
+        let nested_id = nested_item["id"].as_str().unwrap();
+        let token = claim_role(&cfg, nested_id, "plan");
+        let rejected = post(
+            &cfg,
+            &format!("/v1/items/{nested_id}/submit"),
+            json!({
+                "claim_token": token,
+                "document": r#"{"summary":"s","jobs":[{"title":"t","subjobs":[{"title":"child"}]}]}"#,
+            }),
+        );
+        assert_eq!(
+            rejected.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&rejected.body)
+        );
+        assert!(String::from_utf8_lossy(&rejected.body).contains("subjobs"));
+        assert_eq!(item_state_of(&cfg, nested_id), "planning");
+        assert!(!cfg.docs_dir.join(nested_id).join("plan").exists());
+
+        let loose = post_item(&cfg, "Loose", "");
+        let loose_id = loose["id"].as_str().unwrap().to_string();
+        let noted = post(
+            &cfg,
+            &format!("/v1/items/{loose_id}/note"),
+            json!({"text": "while inbox"}),
+        );
+        let noted: Value = serde_json::from_slice(&noted.body).unwrap();
+        assert_eq!(noted["state"], "inbox");
+        let bare_drop = post(
+            &cfg,
+            &format!("/v1/items/{loose_id}/drop"),
+            json!({"force": false}),
+        );
+        assert_eq!(bare_drop.status, 400);
+        let dropped = post_cli(
+            &cfg,
+            &format!("/v1/items/{loose_id}/drop"),
+            json!({"force": false}),
+        );
+        assert_eq!(
+            dropped.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&dropped.body)
+        );
+        assert_eq!(item_state_of(&cfg, &loose_id), "dropped");
+
+        let held = post_item(&cfg, "Held", "");
+        let held_id = held["id"].as_str().unwrap();
+        let _token = claim_role(&cfg, held_id, "plan");
+        assert_eq!(item_state_of(&cfg, held_id), "planning");
+        let refused = post_cli(
+            &cfg,
+            &format!("/v1/items/{held_id}/drop"),
+            json!({"force": false}),
+        );
+        assert_eq!(
+            refused.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(item_state_of(&cfg, held_id), "planning");
+        let forced = post_cli(
+            &cfg,
+            &format!("/v1/items/{held_id}/drop"),
+            json!({"force": true}),
+        );
+        assert_eq!(
+            forced.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&forced.body)
+        );
+        assert_eq!(item_state_of(&cfg, held_id), "dropped");
+        let pid: Option<i64> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_pid FROM items WHERE id = ?1",
+                params![held_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pid.is_none());
+        let job_note = post(
+            &cfg,
+            &format!("/v1/jobs/{job_id}/note"),
+            json!({"text": "nope"}),
+        );
+        assert_eq!(job_note.status, 400);
+        drop(running);
+    }
+
+    fn keel_doc(html: &str) -> Value {
+        let marker = "<script type=\"application/json\" id=\"keel-doc\">";
+        let start = html.find(marker).unwrap() + marker.len();
+        let end = html[start..].find("</script>").unwrap() + start;
+        serde_json::from_str(&html[start..end]).unwrap()
     }
 
     fn loopback_only(port: u16) -> bool {

@@ -78,6 +78,11 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> Result<()> {
         Some("claim") => claim_cmd(config, &args[1..]),
         Some("heartbeat") => heartbeat_cmd(config, &args[1..]),
         Some("release") => release_cmd(config, &args[1..]),
+        Some("note") => note_cmd(config, &args[1..]),
+        Some("waive") => waive_cmd(config, &args[1..]),
+        Some("submit") => submit_cmd(config, &args[1..]),
+        Some("approve") => approve_cmd(config, &args[1..]),
+        Some("drop") => drop_cmd(config, &args[1..]),
         Some(other) => {
             eprintln!("{}", usage());
             Err(Error::Invalid(format!("unknown command {other}")))
@@ -98,7 +103,12 @@ usage:
   keel open ID
   keel claim ID --role plan|revise|implement|review
   keel heartbeat ID --token TOKEN
-  keel release ID [--force]"
+  keel release ID [--force]
+  keel note ID TEXT
+  keel waive ID POINT
+  keel submit ID --token TOKEN [--file PATH]
+  keel approve ID --base SHA
+  keel drop ID [--force]"
 }
 
 fn no_args(cmd: &str, args: &[String]) -> Result<()> {
@@ -384,6 +394,218 @@ fn release_cmd(config: &Config, args: &[String]) -> Result<()> {
         released["state"].as_str().unwrap_or("")
     );
     Ok(())
+}
+
+fn note_cmd(config: &Config, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(Error::Invalid("usage: keel note ID TEXT".into()));
+    }
+    let path = item_action_path(config, &args[0], "note")?;
+    let body = json!({ "text": args[1] });
+    let noted = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!("{}", noted["point_id"].as_str().unwrap_or(""));
+    println!("{}", noted["state"].as_str().unwrap_or(""));
+    warn(&noted);
+    Ok(())
+}
+
+fn waive_cmd(config: &Config, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(Error::Invalid("usage: keel waive ID POINT".into()));
+    }
+    let path = item_action_path(config, &args[0], "waive")?;
+    let body = json!({ "point_id": args[1] });
+    let waived = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!(
+        "{} {}",
+        waived["id"].as_str().unwrap_or(""),
+        waived["state"].as_str().unwrap_or("")
+    );
+    warn(&waived);
+    Ok(())
+}
+
+fn submit_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut token = None;
+    let mut file = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--token" | "--file" => {
+                let flag = arg;
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| Error::Invalid(format!("missing value for {flag}")))?;
+                match flag {
+                    "--token" => token = Some(value.clone()),
+                    _ => file = Some(value.clone()),
+                }
+            }
+            s if s.starts_with("--token=") => token = Some(s["--token=".len()..].to_string()),
+            s if s.starts_with("--file=") => file = Some(s["--file=".len()..].to_string()),
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    let token = token.ok_or_else(|| Error::Invalid("missing --token".into()))?;
+    if token.is_empty() {
+        return Err(Error::Invalid("claim_token is empty".into()));
+    }
+    let document = read_document(file.as_deref())?;
+    let path = item_action_path(config, &id, "submit")?;
+    let body = json!({ "claim_token": token, "document": document });
+    let submitted = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!(
+        "{} {}",
+        submitted["id"].as_str().unwrap_or(""),
+        submitted["state"].as_str().unwrap_or("")
+    );
+    println!("{}", submitted["plan_url"].as_str().unwrap_or(""));
+    warn(&submitted);
+    Ok(())
+}
+
+fn approve_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut base = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--base" => {
+                i += 1;
+                base = Some(
+                    args.get(i)
+                        .ok_or_else(|| Error::Invalid("missing value for --base".into()))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--base=") => base = Some(s["--base=".len()..].to_string()),
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    let base = base.ok_or_else(|| Error::Invalid("missing --base".into()))?;
+    if base.is_empty() {
+        return Err(Error::Invalid("base_sha is empty".into()));
+    }
+    let path = item_action_path(config, &id, "approve")?;
+    let body = json!({ "base_sha": base });
+    let approved = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!(
+        "{} {} {}",
+        approved["id"].as_str().unwrap_or(""),
+        approved["state"].as_str().unwrap_or(""),
+        approved["base_sha"].as_str().unwrap_or("")
+    );
+    if let Some(jobs) = approved.get("job_ids").and_then(Value::as_array) {
+        for job in jobs {
+            if let Some(job_id) = job.as_str() {
+                println!("{job_id}");
+            }
+        }
+    }
+    warn(&approved);
+    Ok(())
+}
+
+fn drop_cmd(config: &Config, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--force" => force = true,
+            s if s.starts_with('-') => {
+                return Err(Error::Invalid(format!("unknown flag {s}")));
+            }
+            s => {
+                if id.is_some() {
+                    return Err(Error::Invalid("unexpected extra argument".into()));
+                }
+                id = Some(s.to_string());
+            }
+        }
+    }
+    let id = id.ok_or_else(|| Error::Invalid("missing id".into()))?;
+    let path = item_action_path(config, &id, "drop")?;
+    let body = json!({ "force": force });
+    let dropped = daemon_json(config, "POST", &path, Some(body.to_string().into_bytes()))?;
+    println!(
+        "{} {}",
+        dropped["id"].as_str().unwrap_or(""),
+        dropped["state"].as_str().unwrap_or("")
+    );
+    Ok(())
+}
+
+fn item_action_path(config: &Config, id: &str, action: &str) -> Result<String> {
+    let resolved = resolve(config, id)?;
+    if resolved["kind"].as_str() != Some("item") {
+        return Err(Error::Invalid(format!("{action} takes an item id")));
+    }
+    let full_id = resolved["id"].as_str().unwrap_or("");
+    if full_id.is_empty() {
+        return Err(Error::NotFound(id.to_string()));
+    }
+    Ok(format!("/v1/items/{full_id}/{action}"))
+}
+
+fn read_document(path: Option<&str>) -> Result<String> {
+    let text = match path {
+        Some(path) => fs::read_to_string(path)?,
+        None if io::stdin().is_terminal() => {
+            return Err(Error::Invalid("missing document".into()));
+        }
+        None => read_stdin_capped(256 * 1024)?,
+    };
+    if text.len() > 256 * 1024 {
+        return Err(Error::Invalid("document exceeds 256 KiB".into()));
+    }
+    Ok(text)
+}
+
+fn read_stdin_capped(max: usize) -> Result<String> {
+    let mut buf = Vec::new();
+    let mut stdin = io::stdin();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stdin.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > max {
+            return Err(Error::Invalid("document exceeds 256 KiB".into()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    String::from_utf8(buf).map_err(|_| Error::Invalid("document is not utf-8".into()))
+}
+
+fn warn(value: &Value) {
+    if let Some(warning) = value.get("warning").and_then(Value::as_str) {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn resolve(config: &Config, id: &str) -> Result<Value> {
@@ -800,5 +1022,166 @@ mod tests {
         )
         .is_err());
         drop(running);
+    }
+
+    #[test]
+    fn note_submit_approve_and_drop_round_trip() {
+        let _rm = Rm(scratch_dir());
+        let (cfg, running) = boot_at(&_rm.0).unwrap();
+        dispatch(
+            &cfg,
+            &[
+                "add".into(),
+                "--repo".into(),
+                "/tmp/repo".into(),
+                "--branch".into(),
+                "main".into(),
+                "Pin the walk".into(),
+            ],
+        )
+        .unwrap();
+        let id: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row("SELECT id FROM items", [], |row| row.get(0))
+            .unwrap();
+        dispatch(
+            &cfg,
+            &["claim".into(), id.clone(), "--role".into(), "plan".into()],
+        )
+        .unwrap();
+        let token: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_token FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let doc_path = _rm.0.join("plan.json");
+        fs::write(
+            &doc_path,
+            r#"{"summary":"from cli","jobs":[{"title":"Walk","acceptance":"yes"}]}"#,
+        )
+        .unwrap();
+        dispatch(
+            &cfg,
+            &[
+                "submit".into(),
+                id.clone(),
+                "--token".into(),
+                token,
+                "--file".into(),
+                doc_path.to_str().unwrap().to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(state_of(&cfg, &id), "awaiting_plan_review");
+        assert!(_rm
+            .0
+            .join("data/docs")
+            .join(&id)
+            .join("plan")
+            .join("r1.html")
+            .is_file());
+        assert!(_rm
+            .0
+            .join("artifacts/keel")
+            .join(&id)
+            .join("plan.html")
+            .is_file());
+        dispatch(&cfg, &["note".into(), id.clone(), "block it".into()]).unwrap();
+        assert_eq!(state_of(&cfg, &id), "revision_requested");
+        let err = dispatch(
+            &cfg,
+            &[
+                "approve".into(),
+                id.clone(),
+                "--base".into(),
+                "fixture-sha".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("409"), "{err}");
+        let point: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM open_points WHERE item_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        dispatch(&cfg, &["waive".into(), id.clone(), point]).unwrap();
+        assert_eq!(state_of(&cfg, &id), "awaiting_plan_review");
+        dispatch(
+            &cfg,
+            &[
+                "approve".into(),
+                id.clone(),
+                "--base".into(),
+                "fixture-sha".into(),
+            ],
+        )
+        .unwrap();
+        let (state, base, jobs): (String, String, i64) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT i.state, i.base_sha, (SELECT COUNT(*) FROM jobs j WHERE j.item_id = i.id)
+                 FROM items i WHERE i.id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "awaiting_implementation");
+        assert_eq!(base, "fixture-sha");
+        assert_eq!(jobs, 1);
+
+        dispatch(&cfg, &["add".into(), "Loose".into()]).unwrap();
+        let loose: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row("SELECT id FROM items WHERE title = 'Loose'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        dispatch(&cfg, &["drop".into(), loose.clone()]).unwrap();
+        assert_eq!(state_of(&cfg, &loose), "dropped");
+
+        dispatch(&cfg, &["add".into(), "Held".into()]).unwrap();
+        let held: String = open(&cfg.db_path)
+            .unwrap()
+            .query_row("SELECT id FROM items WHERE title = 'Held'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        dispatch(
+            &cfg,
+            &["claim".into(), held.clone(), "--role".into(), "plan".into()],
+        )
+        .unwrap();
+        let err = dispatch(&cfg, &["drop".into(), held.clone()]).unwrap_err();
+        assert!(err.to_string().contains("409"), "{err}");
+        assert_eq!(state_of(&cfg, &held), "planning");
+        dispatch(&cfg, &["drop".into(), "--force".into(), held.clone()]).unwrap();
+        assert_eq!(state_of(&cfg, &held), "dropped");
+        let token: Option<String> = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_token FROM items WHERE id = ?1",
+                params![held],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(token.is_none());
+        drop(running);
+    }
+
+    fn state_of(cfg: &crate::config::Config, id: &str) -> String {
+        open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }

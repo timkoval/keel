@@ -1,10 +1,11 @@
-//! Card and queue shells. The daemon is the only writer. Text is escaped.
+//! Card, plan, and queue shells. The daemon is the only writer. Text is escaped.
 //! There is no markdown twin and no author JavaScript.
 
 use serde_json::{json, Value};
 
 const TOKENS: &str = include_str!("../design/tokens.css");
 const CARD: &str = include_str!("../design/card.html");
+const PLAN: &str = include_str!("../design/plan.html");
 const QUEUE: &str = include_str!("../design/queue.html");
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,34 @@ pub struct CardView {
     pub created_at: String,
     pub updated_at: String,
     pub open_points: Vec<PointView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanSection {
+    pub heading: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanJobView {
+    pub id: Option<String>,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub acceptance: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanView {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub summary: String,
+    pub plan_rev: i64,
+    pub updated_at: String,
+    pub previous_url: Option<String>,
+    pub open_points: Vec<PointView>,
+    pub sections: Vec<PlanSection>,
+    pub jobs: Vec<PlanJobView>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +108,31 @@ pub fn card_page(card: &CardView) -> String {
     )
 }
 
+pub fn plan_page(plan: &PlanView) -> String {
+    let doc = plan_doc(plan);
+    let rev = plan.plan_rev.to_string();
+    let previous = match &plan.previous_url {
+        Some(url) => format!("<a href=\"{}\">r{}</a>", escape(url), plan.plan_rev - 1),
+        None => "none".to_string(),
+    };
+    fill(
+        PLAN,
+        &[
+            ("tokens", TOKENS),
+            ("title", &escape(&plan.title)),
+            ("item_id", &escape(&plan.id)),
+            ("state", &escape(&plan.state)),
+            ("rev", &rev),
+            ("summary", &escape(&plan.summary)),
+            ("sections", &sections_html(&plan.sections)),
+            ("points", &points_html(&plan.open_points)),
+            ("jobs", &jobs_html(&plan.jobs)),
+            ("previous", &previous),
+            ("doc", &json_for_html(&doc)),
+        ],
+    )
+}
+
 pub fn queue_page(queue: &QueueView) -> String {
     let mut rows = String::new();
     for row in &queue.rows {
@@ -117,6 +171,91 @@ pub fn queue_page(queue: &QueueView) -> String {
             ("doc", &json_for_html(&doc)),
         ],
     )
+}
+
+fn plan_doc(plan: &PlanView) -> Value {
+    let points: Vec<Value> = plan
+        .open_points
+        .iter()
+        .map(|point| {
+            json!({
+                "id": point.id,
+                "text": point.text,
+                "status": point.status,
+            })
+        })
+        .collect();
+    let jobs: Vec<Value> = plan
+        .jobs
+        .iter()
+        .map(|job| {
+            json!({
+                "id": job.id,
+                "parent_id": job.parent_id,
+                "title": job.title,
+                "acceptance": job.acceptance,
+            })
+        })
+        .collect();
+    json!({
+        "keel": 1,
+        "kind": "plan",
+        "item_id": plan.id,
+        "job_id": Value::Null,
+        "rev": plan.plan_rev,
+        "state": plan.state,
+        "title": plan.title,
+        "updated_at": plan.updated_at,
+        "summary": plan.summary,
+        "open_points": points,
+        "jobs": jobs,
+        "diff": Value::Null,
+        "verdict": Value::Null,
+    })
+}
+
+fn sections_html(sections: &[PlanSection]) -> String {
+    let mut out = String::new();
+    for section in sections {
+        out.push_str("  <section><h2>");
+        out.push_str(&escape(&section.heading));
+        out.push_str("</h2><pre class=\"body\">");
+        out.push_str(&escape(&section.body));
+        out.push_str("</pre></section>\n");
+    }
+    out
+}
+
+fn points_html(points: &[PointView]) -> String {
+    let mut out = String::new();
+    for point in points {
+        out.push_str("    <li><span class=\"mono dim\">");
+        out.push_str(&escape(&point.id));
+        out.push_str("</span><span class=\"chip\">");
+        out.push_str(&escape(&point.status));
+        out.push_str("</span><span class=\"grow\">");
+        out.push_str(&escape(&point.text));
+        out.push_str("</span></li>\n");
+    }
+    out
+}
+
+fn jobs_html(jobs: &[PlanJobView]) -> String {
+    let mut out = String::new();
+    for job in jobs {
+        out.push_str("    <li>");
+        if let Some(id) = &job.id {
+            out.push_str("<span class=\"mono dim\">");
+            out.push_str(&escape(id));
+            out.push_str("</span>");
+        }
+        out.push_str("<span class=\"grow\">");
+        out.push_str(&escape(&job.title));
+        out.push_str("</span><span class=\"dim\">");
+        out.push_str(&escape(&job.acceptance));
+        out.push_str("</span></li>\n");
+    }
+    out
 }
 
 fn card_doc(card: &CardView) -> Value {

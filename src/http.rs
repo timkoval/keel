@@ -6,8 +6,8 @@ use crate::db::{Error, Result};
 
 const HEADER_MAX: usize = 16 * 1024;
 /// Decoded item bodies stop at 32 KiB. A JSON `\uXXXX` escape is 6 bytes per input byte,
-/// plus the title and the rest of the object.
-const BODY_MAX: usize = 32 * 1024 * 6 + 16 * 1024;
+/// plus the title and the rest of the object. A plan document adds its own 256 KiB cap.
+const BODY_MAX: usize = 256 * 1024 + 32 * 1024 * 6 + 16 * 1024;
 
 #[derive(Debug)]
 pub struct Request {

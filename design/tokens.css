@@ -73,6 +73,12 @@ h1 {
   margin: 0 0 0.8rem;
 }
 
+h2 {
+  font-size: 1rem;
+  font-weight: 700;
+  margin: 1.1rem 0 0.35rem;
+}
+
 dl {
   display: grid;
   grid-template-columns: 7.5rem 1fr;
@@ -112,3 +118,19 @@ pre.body {
 .queue a:hover { color: var(--green); }
 
 .queue .grow { flex: 1; min-width: 0; }
+
+.points, .jobs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.points li, .jobs li {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.points .grow, .jobs .grow { flex: 1; min-width: 0; }

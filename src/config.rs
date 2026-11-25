@@ -28,6 +28,14 @@ impl Config {
         format!("http://127.0.0.1:{}/i/{id}/card", self.port)
     }
 
+    pub fn plan_url(&self, id: &str) -> String {
+        format!("http://127.0.0.1:{}/i/{id}/plan", self.port)
+    }
+
+    pub fn plan_rev_url(&self, id: &str, rev: i64) -> String {
+        format!("http://127.0.0.1:{}/i/{id}/plan/r/{rev}", self.port)
+    }
+
     pub fn origin(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
