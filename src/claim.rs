@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 use crate::daemon;
 use crate::db::{Error, Result};
 use crate::git::{self, PrimarySnapshot};
+use crate::proc::{self, ProcLease};
 use crate::state::{self, Claim, ClaimSpec, Release, ReleaseCause, Role};
 
 const PROMPT_MAX: usize = 64 * 1024;
@@ -128,7 +129,8 @@ pub fn claim_and_prepare(
     }
 }
 
-/// One heartbeat, no process. `keel run` uses this until a real adapter exists.
+/// One heartbeat, no model process. `keel run` still calls this after the daemon
+/// has spawned the test child.
 pub fn fake_heartbeat(socket_path: &Path, role: Role, id: &str, token: &str) -> Result<String> {
     let path = heartbeat_path(role, id);
     let body = serde_json::json!({ "claim_token": token }).to_string();
@@ -171,10 +173,35 @@ pub fn release(
     mut release: Release,
     data_dir: &Path,
 ) -> Result<String> {
+    let observed = {
+        let conn = lock_db(db)?;
+        load_observed(&conn, target, id)?
+    };
+    // Kill outside the mutex. The state function only records the transition
+    // after the group is empty; it does not signal.
+    let gone = match proc::prepare_gone(&observed.proc) {
+        Ok(gone) => gone,
+        Err(Error::Conflict { message, .. }) => {
+            return Err(Error::Conflict {
+                state: observed.state,
+                message,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    if !observed.proc.external && observed.proc.pgid.is_some() && !gone {
+        let message = if proc::leader_reused(&observed.proc) {
+            "leader pid was reused; not signaled"
+        } else {
+            "process group is not empty"
+        };
+        return Err(Error::Conflict {
+            state: observed.state,
+            message: message.into(),
+        });
+    }
+    release.pid_gone = gone;
     let mut conn = lock_db(db)?;
-    // The body cannot claim a live pid is gone. A null pid stays not-gone,
-    // so expiry still refuses the pre-spawn window.
-    release.pid_gone = pid_is_gone(&conn, target, id)?;
     // Read before the transition. It clears claim_role. Implement and review
     // checkouts stay: the next claim reuses them. Plan and revise are removed
     // on release and on expiry, outside this mutex.
@@ -189,6 +216,26 @@ pub fn release(
         git::remove_worktree(&repo, &path)?;
     }
     Ok(state_name)
+}
+
+/// Startup passes `startup` so a spawned group is killed even if the timer has
+/// not expired. A null pid is left leased. External pids are not signaled.
+pub fn reap(db: &Mutex<Connection>, data_dir: &Path, startup: bool) -> Result<()> {
+    let rows = {
+        let conn = lock_db(db)?;
+        load_reap_rows(&conn)?
+    };
+    for row in rows {
+        if !proc::should_expire(&row.proc, startup, row.expired) {
+            continue;
+        }
+        // One stuck group must not stop the others. The row stays leased when
+        // the group does not become empty.
+        if let Err(_err) = release(db, row.target, &row.id, Release::expiry(true), data_dir) {
+            continue;
+        }
+    }
+    Ok(())
 }
 
 /// Dozens of ids. This is a primary-key filter, not a scan to upgrade, until
@@ -216,6 +263,13 @@ pub fn resolve_id(conn: &Connection, prefix: &str) -> Result<Resolved> {
             message: "id prefix matches more than one row; pass the full id".into(),
         }),
     }
+}
+
+pub fn requests_spawn(body: &[u8]) -> Result<bool> {
+    if body.is_empty() {
+        return Ok(false);
+    }
+    optional_bool(&object(body)?, "spawn")
 }
 
 pub fn parse_claim(body: &[u8]) -> Result<ClaimInput> {
@@ -347,33 +401,83 @@ fn worker_id(input: &ClaimInput) -> Result<String> {
     Ok(format!("{adapter}:{}", random_hex(16)?))
 }
 
-fn pid_is_gone(conn: &Connection, target: Target, id: &str) -> Result<bool> {
+struct Observed {
+    state: String,
+    proc: ProcLease,
+}
+
+fn load_observed(conn: &Connection, target: Target, id: &str) -> Result<Observed> {
     let sql = match target {
-        Target::Item => "SELECT claim_pid, claim_starttime FROM items WHERE id = ?1",
-        Target::Job => "SELECT claim_pid, claim_starttime FROM jobs WHERE id = ?1",
+        Target::Item => {
+            "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime
+             FROM items WHERE id = ?1"
+        }
+        Target::Job => {
+            "SELECT state, claim_external, claim_pid, claim_pgid, claim_starttime
+             FROM jobs WHERE id = ?1"
+        }
     };
-    let row = conn
-        .query_row(sql, params![id], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
+    conn.query_row(sql, params![id], |row| {
+        Ok(Observed {
+            state: row.get(0)?,
+            proc: ProcLease {
+                external: row.get::<_, i64>(1)? != 0,
+                pid: row.get(2)?,
+                pgid: row.get(3)?,
+                starttime: row.get(4)?,
+            },
         })
-        .optional()?;
-    let Some((pid, starttime)) = row else {
-        return Ok(false);
-    };
-    // Null pid is the unsupervised window. It is not "gone", and expiry must not clear it.
-    let Some(pid) = pid else {
-        return Ok(false);
-    };
-    if pid <= 0 || pid > i64::from(u32::MAX) {
-        return Ok(true);
+    })
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
+}
+
+struct ReapRow {
+    target: Target,
+    id: String,
+    expired: bool,
+    proc: ProcLease,
+}
+
+fn load_reap_rows(conn: &Connection) -> Result<Vec<ReapRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, id, claim_external, claim_pid, claim_pgid, claim_starttime, expired FROM (
+            SELECT 'item' AS kind, id, claim_external, claim_pid, claim_pgid, claim_starttime,
+                   CASE WHEN lease_until IS NOT NULL
+                             AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                        THEN 1 ELSE 0 END AS expired
+            FROM items WHERE claim_token IS NOT NULL
+            UNION ALL
+            SELECT 'job', id, claim_external, claim_pid, claim_pgid, claim_starttime,
+                   CASE WHEN lease_until IS NOT NULL
+                             AND lease_until <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                        THEN 1 ELSE 0 END
+            FROM jobs WHERE claim_token IS NOT NULL
+        )",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(0)?;
+        Ok(ReapRow {
+            target: if kind == "job" {
+                Target::Job
+            } else {
+                Target::Item
+            },
+            id: row.get(1)?,
+            proc: ProcLease {
+                external: row.get::<_, i64>(2)? != 0,
+                pid: row.get(3)?,
+                pgid: row.get(4)?,
+                starttime: row.get(5)?,
+            },
+            expired: row.get::<_, i64>(6)? != 0,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
     }
-    match daemon::read_proc_starttime(pid as u32) {
-        None => Ok(true),
-        Some(live) => Ok(starttime.as_deref() != Some(live.as_str())),
-    }
+    Ok(out)
 }
 
 fn read_text(

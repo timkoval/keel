@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(test)]
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
@@ -22,6 +22,7 @@ use crate::claim::{self, Target};
 use crate::config::Config;
 use crate::db::{open, Error, Result};
 use crate::http::{self, Request, Response};
+use crate::proc;
 use crate::render::{
     self, CardView, PlanJobView, PlanSection, PlanView, PointView, QueueLink, QueueView,
 };
@@ -105,6 +106,10 @@ pub(crate) fn serve(config: &Config, shutdown: &AtomicBool) -> Result<()> {
         db: Mutex::new(db),
         config: config.clone(),
     });
+    // Before accept, so a restart cannot hand the worktree to a new claim
+    // while the previous group is still alive. Failures leave the row leased.
+    let _ = claim::reap(&shared.db, &shared.config.data_dir, true);
+    let mut next_reap = Instant::now() + Duration::from_secs(30);
     // Polled accept so a test can stop the thread without a signal.
     while !shutdown.load(Ordering::SeqCst) {
         let mut idle = true;
@@ -131,6 +136,13 @@ pub(crate) fn serve(config: &Config, shutdown: &AtomicBool) -> Result<()> {
                 let _ = fs::remove_file(&config.socket_path);
                 return Err(err.into());
             }
+        }
+        if Instant::now() >= next_reap {
+            next_reap = Instant::now() + Duration::from_secs(30);
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let _ = claim::reap(&shared.db, &shared.config.data_dir, false);
+            });
         }
         if idle {
             thread::sleep(Duration::from_millis(20));
@@ -296,23 +308,49 @@ fn mutate_response(
                 Ok(input) => input,
                 Err(err) => return fail(err),
             };
+            let spawn = match claim::requests_spawn(&req.body) {
+                Ok(spawn) => spawn,
+                Err(err) => return fail(err),
+            };
+            if spawn && input.pid.is_some() {
+                return fail(Error::Invalid("external claim is not spawned".into()));
+            }
             match claim::claim_and_prepare(&shared.db, target, id, &input, &shared.config.data_dir)
             {
-                Ok(prepared) => Response::json(
-                    200,
-                    json!({
-                        "id": prepared.id,
-                        "kind": prepared.target.as_str(),
-                        "role": prepared.claim.role.as_str(),
-                        "claim_token": prepared.claim.token,
-                        "worker_id": prepared.claim.worker_id,
-                        "lease_until": prepared.claim.lease_until,
-                        "worktree": prepared.worktree.as_ref().map(|path| path.display().to_string()),
-                        "prompt_path": prepared.prompt_path.display().to_string(),
-                        "diff_path": prepared.diff_path.as_ref().map(|path| path.display().to_string()),
-                        "snapshot": snapshot_json(prepared.snapshot.as_ref()),
-                    }),
-                ),
+                Ok(prepared) => {
+                    if spawn {
+                        if let Err(err) = spawn_and_attach(
+                            shared,
+                            &prepared.id,
+                            &prepared.claim.token,
+                            prepared.worktree.as_deref(),
+                        ) {
+                            let _ = claim::release(
+                                &shared.db,
+                                target,
+                                id,
+                                state::Release::human(),
+                                &shared.config.data_dir,
+                            );
+                            return fail(err);
+                        }
+                    }
+                    Response::json(
+                        200,
+                        json!({
+                            "id": prepared.id,
+                            "kind": prepared.target.as_str(),
+                            "role": prepared.claim.role.as_str(),
+                            "claim_token": prepared.claim.token,
+                            "worker_id": prepared.claim.worker_id,
+                            "lease_until": prepared.claim.lease_until,
+                            "worktree": prepared.worktree.as_ref().map(|path| path.display().to_string()),
+                            "prompt_path": prepared.prompt_path.display().to_string(),
+                            "diff_path": prepared.diff_path.as_ref().map(|path| path.display().to_string()),
+                            "snapshot": snapshot_json(prepared.snapshot.as_ref()),
+                        }),
+                    )
+                }
                 Err(err) => fail(err),
             }
         }
@@ -417,6 +455,39 @@ fn method_not_allowed(allow: &str) -> Response {
 
 fn missing(id: &str) -> Response {
     http::error_response(404, &Error::NotFound(id.to_string()))
+}
+
+fn spawn_and_attach(shared: &Shared, id: &str, token: &str, worktree: Option<&Path>) -> Result<()> {
+    let marker = match worktree {
+        Some(path) => path.join(proc::GRANDCHILD_FILE),
+        None => shared
+            .config
+            .data_dir
+            .join("spawns")
+            .join(id)
+            .join(proc::GRANDCHILD_FILE),
+    };
+    let spawned = proc::spawn_marker(&marker)?;
+    let mut conn = match lock_db(&shared.db) {
+        Ok(conn) => conn,
+        Err(err) => {
+            let _ = proc::empty_group(spawned.pgid, spawned.pid);
+            return Err(err);
+        }
+    };
+    if let Err(err) = state::attach_process(
+        &mut conn,
+        id,
+        token,
+        spawned.pid,
+        spawned.pgid,
+        &spawned.starttime,
+    ) {
+        drop(conn);
+        let _ = proc::empty_group(spawned.pgid, spawned.pid);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn snapshot_json(snapshot: Option<&crate::git::PrimarySnapshot>) -> Value {
@@ -729,23 +800,32 @@ fn load_status(conn: &Connection, config: &Config) -> Result<Value> {
         counts.insert(state, json!(count));
     }
     let mut lease_stmt = conn.prepare(
-        "SELECT 'item', id, claim_worker, claim_role, claim_pid, claim_starttime, lease_until
+        "SELECT 'item', id, claim_worker, claim_role, claim_pid, claim_starttime, lease_until,
+                claim_external
          FROM items WHERE claim_token IS NOT NULL
          UNION ALL
-         SELECT 'job', id, claim_worker, claim_role, claim_pid, claim_starttime, lease_until
+         SELECT 'job', id, claim_worker, claim_role, claim_pid, claim_starttime, lease_until,
+                claim_external
          FROM jobs WHERE claim_token IS NOT NULL
          ORDER BY 1, 2",
     )?;
     let leases = lease_stmt.query_map([], |row| {
-        Ok(json!({
+        let pid = row.get::<_, Option<i64>>(4)?;
+        let external = row.get::<_, i64>(7)? != 0;
+        let mut lease = json!({
             "kind": row.get::<_, String>(0)?,
             "id": row.get::<_, String>(1)?,
             "worker": row.get::<_, Option<String>>(2)?,
             "role": row.get::<_, Option<String>>(3)?,
-            "pid": row.get::<_, Option<i64>>(4)?,
+            "pid": pid,
             "starttime": row.get::<_, Option<String>>(5)?,
             "lease_until": row.get::<_, Option<String>>(6)?,
-        }))
+        });
+        // The crash window between insert and spawn. The reaper will not requeue it.
+        if pid.is_none() && !external {
+            lease["unsupervised"] = json!(true);
+        }
+        Ok(lease)
     })?;
     let mut lease_rows = Vec::new();
     for lease in leases {

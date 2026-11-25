@@ -253,7 +253,8 @@ fn claim_cmd(config: &Config, args: &[String]) -> Result<()> {
 fn run_cmd(config: &Config, args: &[String]) -> Result<()> {
     let (id, role, adapter, worker) = parse_role_flags(args)?;
     let adapter = adapter.unwrap_or_else(|| "fake".to_string());
-    // No model binary. The fake adapter only heartbeats on the socket.
+    // No model binary. The fake adapter asks the daemon to spawn a test child
+    // in its own process group, then heartbeats once.
     if adapter != "fake" {
         return Err(Error::Invalid(
             "only the fake adapter is available; it does not spawn a model".into(),
@@ -267,6 +268,7 @@ fn run_cmd(config: &Config, args: &[String]) -> Result<()> {
     let mut payload = json!({
         "role": role.as_str(),
         "adapter": adapter,
+        "spawn": true,
     });
     if let Some(worker) = worker {
         payload["worker_id"] = json!(worker);
@@ -886,8 +888,12 @@ pub(crate) fn render_status(status: &Value) -> String {
     out.push_str(&format!("leases: {n}/{cap}\n"));
     if let Some(rows) = leases {
         for lease in rows {
+            let unsupervised = lease
+                .get("unsupervised")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             out.push_str(&format!(
-                "lease {} {} pid={} starttime={} lease_until={} worker={} role={}\n",
+                "lease {} {} pid={} starttime={} lease_until={} worker={} role={}{}\n",
                 text(lease, "kind"),
                 text(lease, "id"),
                 dash(lease.get("pid")),
@@ -895,6 +901,7 @@ pub(crate) fn render_status(status: &Value) -> String {
                 dash(lease.get("lease_until")),
                 dash(lease.get("worker")),
                 dash(lease.get("role")),
+                if unsupervised { " unsupervised" } else { "" },
             ));
         }
     }
@@ -1016,6 +1023,26 @@ mod tests {
         assert!(status.contains("planning: 0\n"));
         assert!(status.contains("leases: 0/4\n"));
         assert!(status.contains("pid: 9\n"));
+        let unsupervised = render_status(&json!({
+            "profile": "default",
+            "pid": 9,
+            "socket": "/tmp/keel.sock",
+            "port": 7431,
+            "lease_cap": 4,
+            "counts": {"inbox": 0},
+            "leases": [{
+                "kind": "item",
+                "id": "k",
+                "pid": null,
+                "unsupervised": true,
+                "worker": "fake:1",
+                "role": "plan",
+                "starttime": null,
+                "lease_until": "t"
+            }]
+        }));
+        assert!(unsupervised.contains("pid=-"));
+        assert!(unsupervised.contains(" unsupervised\n"));
     }
 
     #[test]
@@ -1273,6 +1300,23 @@ mod tests {
             &["run".into(), id.clone(), "--role".into(), "plan".into()],
         )
         .unwrap();
+        let (pid, pgid, start): (i64, i64, String) = open(&cfg.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT claim_pid, claim_pgid, claim_starttime FROM items WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let _guard = crate::proc::GroupGuard {
+            pgid: Some(pgid),
+            pid: Some(pid),
+        };
+        assert_eq!(pid, pgid);
+        assert_eq!(
+            crate::daemon::read_proc_starttime(pid as u32).as_deref(),
+            Some(start.as_str())
+        );
         assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
         assert_eq!(crate::git::snapshot(&repo).unwrap().branch, "main");
         assert!(crate::git::snapshot(&repo).unwrap().porcelain.is_empty());
@@ -1294,6 +1338,28 @@ mod tests {
             )
             .unwrap();
         assert!(!until.is_empty());
+        let marker = worktree.join(crate::proc::GRANDCHILD_FILE);
+        let mut grandchild = String::new();
+        for _ in 0..100 {
+            if let Ok(text) = fs::read_to_string(&marker) {
+                if !text.trim().is_empty() {
+                    grandchild = text;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let gpid: i64 = grandchild
+            .trim()
+            .parse()
+            .expect("grandchild did not write the worktree");
+        assert_ne!(gpid, pid);
+        assert!(std::path::Path::new(&format!("/proc/{gpid}")).exists());
+        dispatch(&cfg, &["release".into(), id.clone()]).unwrap();
+        assert_eq!(state_of(&cfg, &id), "inbox");
+        assert!(crate::proc::group_empty(pgid).unwrap());
+        assert!(!std::path::Path::new(&format!("/proc/{gpid}")).exists());
+        assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
         drop(running);
     }
 
