@@ -67,9 +67,24 @@ impl From<std::io::Error> for Error {
 ///
 /// `foreign_keys` is not persisted by SQLite, so every open turns it on.
 /// Otherwise the schema's REFERENCES are not enforced.
+///
+/// An existing file whose `user_version` is behind this binary is copied
+/// aside before `migrate`. The copy uses the daily bak path, so a later
+/// startup does not replace that pre-migration file with the new schema.
+/// A fresh file is not copied: opening it creates an empty database.
 pub fn open(path: &Path) -> Result<Connection> {
+    let existed = path.exists();
     let mut conn = Connection::open(path)?;
     configure(&conn)?;
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > LATEST || version < 0 {
+        return Err(Error::Invalid(format!(
+            "database user_version {version} is newer than this binary ({LATEST})"
+        )));
+    }
+    if existed && version < LATEST {
+        crate::doctor::backup_if_stale(&conn, path)?;
+    }
     migrate(&mut conn)?;
     Ok(conn)
 }

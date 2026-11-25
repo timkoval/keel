@@ -739,25 +739,54 @@ pub(crate) fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Resu
     }
 }
 
-/// First-parent merge commits reachable from `HEAD`, newest first.
-/// Read-only. Leaf merges live on the second parent, so they are not listed.
-pub(crate) fn first_parent_merges(repo: &Path) -> Result<Vec<(String, String)>> {
+/// How many first-parent commits doctor will read. A `--merges` walk with no
+/// cap still traverses the whole history when merges are rare, and `keel doctor`
+/// has to return inside its request budget.
+pub(crate) const FIRST_PARENT_WALK: usize = 128;
+
+pub(crate) struct FirstParentCommit {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub message: String,
+}
+
+/// First-parent commits from `HEAD`, newest first, at most [`FIRST_PARENT_WALK`].
+/// Read-only. The message is the raw subject and body (`%B`).
+pub(crate) fn first_parent_commits(repo: &Path) -> Result<Vec<FirstParentCommit>> {
+    let limit = FIRST_PARENT_WALK.to_string();
     let text = git_text(
         repo,
-        &["log", "--first-parent", "--merges", "--format=%H%x1f%s"],
+        &[
+            "log",
+            "-n",
+            &limit,
+            "--first-parent",
+            "--format=%H%x1f%P%x1f%B%x1e",
+        ],
     )?;
     let mut out = Vec::new();
-    for line in text.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
+    for record in text.split('\u{1e}') {
+        let record = record.trim();
+        if record.is_empty() {
             continue;
         }
-        let Some((sha, subject)) = line.split_once('\u{1f}') else {
+        let mut parts = record.splitn(3, '\u{1f}');
+        let sha = parts.next().unwrap_or("").trim();
+        let parents = parts.next().unwrap_or("");
+        let message = parts.next().unwrap_or("").trim_end_matches(['\n', '\r']);
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
-        };
-        if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
-            out.push((sha.to_string(), subject.to_string()));
         }
+        let parents = parents
+            .split_whitespace()
+            .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_string)
+            .collect();
+        out.push(FirstParentCommit {
+            sha: sha.to_string(),
+            parents,
+            message: message.to_string(),
+        });
     }
     Ok(out)
 }

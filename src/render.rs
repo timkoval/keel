@@ -147,36 +147,23 @@ pub struct ReviewView {
     pub verdict: String,
     pub base: String,
     pub head: String,
+    /// `git diff --stat` between `base` and `head`. Not the worker's copy.
     pub stat: String,
+    /// Submitted `review_json`. Findings and residual risk stay in this object.
+    pub stored: Value,
 }
 
-/// Current review document. Doctor re-renders this when `review_json` is set
-/// and the canonical file is gone. It is not a second published JSON file.
+/// Current review document. Doctor re-renders this from `review_json` plus
+/// the job's `base_sha`, `diff_ref`, and a daemon `git diff --stat`.
 pub fn review_page(review: &ReviewView) -> String {
-    let verdict = if review.verdict.is_empty() {
-        Value::Null
-    } else {
-        json!(review.verdict)
-    };
-    let doc = json!({
-        "keel": 1,
-        "kind": "review",
-        "item_id": review.item_id,
-        "job_id": review.job_id,
-        "rev": review.rev,
-        "state": review.state,
-        "title": review.title,
-        "updated_at": review.updated_at,
-        "summary": review.summary,
-        "open_points": [],
-        "jobs": [],
-        "diff": {
-            "base": review.base,
-            "head": review.head,
-            "stat": review.stat,
-        },
-        "verdict": verdict,
-    });
+    let doc = review_doc_value(review);
+    let mut findings = String::new();
+    for line in finding_lines(&review.stored) {
+        findings.push_str("    <li>");
+        findings.push_str(&escape(&line));
+        findings.push_str("</li>\n");
+    }
+    let residual = residual_text(&review.stored);
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
 <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'\">\n\
@@ -184,6 +171,8 @@ pub fn review_page(review: &ReviewView) -> String {
 <header class=\"top\"><span class=\"brand\">keel</span><span class=\"mono id\">{item}</span>\
 <span class=\"mono dim\">{job}</span><span class=\"chip\">{state}</span></header>\n\
 <main><h1>{title}</h1><p class=\"chip\">{verdict}</p><pre class=\"body\">{summary}</pre>\
+<h2>findings</h2>\n<ul class=\"points\">\n{findings}</ul>\n\
+<h2>residual risk</h2>\n<pre class=\"body\">{residual}</pre>\n\
 <p class=\"mono\">{base}..{head}</p><pre class=\"body\">{stat}</pre></main>\n\
 <script type=\"application/json\" id=\"keel-doc\">{doc}</script>\n</body>\n</html>\n",
         title = escape(&review.title),
@@ -193,11 +182,81 @@ pub fn review_page(review: &ReviewView) -> String {
         state = escape(&review.state),
         verdict = escape(&review.verdict),
         summary = escape(&review.summary),
+        findings = findings,
+        residual = escape(&residual),
         base = escape(&review.base),
         head = escape(&review.head),
         stat = escape(&review.stat),
         doc = json_for_html(&doc),
     )
+}
+
+fn review_doc_value(review: &ReviewView) -> Value {
+    let mut doc = if review.stored.is_object() {
+        review.stored.clone()
+    } else {
+        json!({})
+    };
+    let obj = doc.as_object_mut().expect("review doc is an object");
+    obj.insert("keel".into(), json!(1));
+    obj.insert("kind".into(), json!("review"));
+    obj.insert("item_id".into(), json!(review.item_id));
+    obj.insert("job_id".into(), json!(review.job_id));
+    obj.insert("rev".into(), json!(review.rev));
+    obj.insert("state".into(), json!(review.state));
+    obj.insert("title".into(), json!(review.title));
+    obj.insert("updated_at".into(), json!(review.updated_at));
+    obj.insert("summary".into(), json!(review.summary));
+    obj.entry("open_points").or_insert(json!([]));
+    obj.entry("jobs").or_insert(json!([]));
+    obj.insert(
+        "diff".into(),
+        json!({
+            "base": review.base,
+            "head": review.head,
+            "stat": review.stat,
+        }),
+    );
+    if review.verdict.is_empty() {
+        obj.entry("verdict").or_insert(Value::Null);
+    } else {
+        obj.insert("verdict".into(), json!(review.verdict));
+    }
+    doc
+}
+
+fn finding_lines(stored: &Value) -> Vec<String> {
+    match stored.get("findings") {
+        Some(Value::String(text)) if !text.is_empty() => vec![text.clone()],
+        Some(Value::Array(items)) => items.iter().filter_map(finding_text).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn finding_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+        return None;
+    }
+    for key in ["text", "summary", "body", "message"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn residual_text(stored: &Value) -> String {
+    for key in ["residual_risk", "residual"] {
+        if let Some(text) = stored.get(key).and_then(Value::as_str) {
+            return text.to_string();
+        }
+    }
+    String::new()
 }
 
 pub fn queue_page(queue: &QueueView) -> String {
