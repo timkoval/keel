@@ -1,0 +1,16 @@
+[Unit]
+Description=Keel daemon (keel serve)
+# Console restarts must not drop this process. Not PartOf or WantedBy grokback.target.
+
+[Service]
+Type=simple
+Environment=HOME=%h
+# Crate name is `keel`. This tree does not install a fixed binary path.
+ExecStart=/usr/bin/env keel serve
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
