@@ -13,6 +13,7 @@ pub(crate) mod git;
 pub(crate) mod http;
 pub(crate) mod mcp;
 pub(crate) mod proc;
+pub(crate) mod psinfo;
 pub(crate) mod render;
 pub mod state;
 pub(crate) mod tui;

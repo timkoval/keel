@@ -836,7 +836,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker, WORKER);
-        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(crate::psinfo::pid_visible(pid));
 
         let beat = tool(
             &cfg,
@@ -866,11 +866,11 @@ mod tests {
         );
         assert_eq!(item_state(&cfg, &id), "planning");
         // Live external pid: release did not signal it.
-        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(crate::psinfo::pid_visible(pid));
 
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!crate::psinfo::pid_visible(pid));
         let released = tool(
             &cfg,
             "keel_release",

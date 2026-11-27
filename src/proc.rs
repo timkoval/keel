@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::daemon::read_proc_starttime;
 use crate::db::{Error, Result};
+use crate::psinfo::read_pgrp;
 
 /// Linux errno and signals. These values are the kernel ABI, not libc headers.
 const ESRCH: i32 = 3;
@@ -342,14 +343,6 @@ fn record_gone(pid: i64, starttime: Option<&str>) -> bool {
     }
 }
 
-fn read_pgrp(pid: u32) -> Option<i64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let end = text.rfind(')')?;
-    let fields: Vec<&str> = text[end + 1..].split_whitespace().collect();
-    // `/proc/pid/stat` field 5, the third field after `comm`.
-    fields.get(2)?.parse().ok()
-}
-
 #[cfg(test)]
 pub(crate) struct GroupGuard {
     pub pgid: Option<i64>,
@@ -370,6 +363,7 @@ mod tests {
     use super::*;
     use crate::claim::{self, ClaimInput, Target};
     use crate::db::open_in_memory;
+    use crate::psinfo::{pid_visible, still_running};
     use crate::state::{self, RawIntake, Release};
     use rusqlite::params;
     use std::os::unix::process::CommandExt;
@@ -391,18 +385,13 @@ mod tests {
         path
     }
 
-    fn proc_state(pid: i64) -> Option<char> {
-        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let end = text.rfind(')')?;
-        text[end + 1..]
-            .split_whitespace()
-            .next()
-            .and_then(|state| state.chars().next())
-    }
-
-    /// Sleeping or running. A zombie means we signaled and have not reaped.
-    fn still_running(pid: i64) -> bool {
-        matches!(proc_state(pid), Some('S') | Some('R') | Some('D'))
+    /// `Some` while the pid is still listed. The state character is Linux-only.
+    fn proc_state(pid: i64) -> Option<()> {
+        if pid_visible(pid) {
+            Some(())
+        } else {
+            None
+        }
     }
 
     fn wait_marker(path: &Path) -> bool {

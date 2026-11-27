@@ -31,7 +31,7 @@ A future Tailscale Serve of 7431 must stay GET-only and must not be pointed at t
 
 `systemd/keel.service` runs `keel serve` with no arguments, which is the default profile (`default`, unless `~/.config/keel/config.toml` sets `profile`). It is a user unit. It is not part of `grokback.target`. Checking out this repository does not install or enable it.
 
-`keel` must be on the `systemd --user` PATH (the unit calls `/usr/bin/env keel serve`; it does not hard-code a binary path). To install it yourself:
+`keel` must be on the `systemd --user` PATH (the unit calls `/usr/bin/env keel serve`; it does not hard-code a binary path). The unit is Linux-only. On macOS, run `keel serve` yourself. To install the unit:
 
 ```
 mkdir -p ~/.config/systemd/user

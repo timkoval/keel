@@ -591,10 +591,7 @@ fn spawn_grouped(
 }
 
 fn read_pgrp(pid: u32) -> Option<i64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let end = text.rfind(')')?;
-    let fields: Vec<&str> = text[end + 1..].split_whitespace().collect();
-    fields.get(2)?.parse().ok()
+    crate::psinfo::read_pgrp(pid)
 }
 
 fn heartbeat_loop(

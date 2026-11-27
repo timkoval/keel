@@ -871,14 +871,7 @@ fn dial(port: u16, secret: &str, pid: i64) -> Result<Socket> {
 }
 
 fn leader_dead(pid: i64) -> bool {
-    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return true;
-    };
-    let Some(end) = text.rfind(')') else {
-        return true;
-    };
-    // A zombie still occupies the process group until the parent waits.
-    matches!(text[end + 1..].split_whitespace().next(), Some("Z") | None)
+    crate::psinfo::leader_dead(pid)
 }
 
 fn dial_once(port: u16, secret: &str) -> Result<Socket> {
@@ -1041,10 +1034,7 @@ fn spawn_grouped(program: &Path, args: &[String], log_path: &Path) -> Result<Spa
 }
 
 fn read_pgrp(pid: u32) -> Option<i64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let end = text.rfind(')')?;
-    let fields: Vec<&str> = text[end + 1..].split_whitespace().collect();
-    fields.get(2)?.parse().ok()
+    crate::psinfo::read_pgrp(pid)
 }
 
 fn pick_port() -> Result<u16> {
