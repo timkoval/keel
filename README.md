@@ -10,6 +10,17 @@ Design: `~/agent-artifacts/shared/plans/keel.md`
 
 That file is the specification. This repository does not carry a second copy.
 
+## Build
+
+The toolchain is `devenv`, pinned by `rust-toolchain.toml` (Rust 1.91.1, with `rustfmt` and `clippy`). From this directory:
+
+```
+devenv shell -- cargo test
+devenv shell -- cargo install --path . --locked --root ~/.local
+```
+
+`devenv.lock` pins the Nix inputs. After changing `devenv.yaml`, run `devenv update`.
+
 ## Ports
 
 TCP `127.0.0.1:7431` is GET-only (health and documents). Counts and every mutation stay on the Unix socket. Keel does not own `grokback-bridge` on 7429 or `grok agent serve` on 2419.
