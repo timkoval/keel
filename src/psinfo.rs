@@ -1,8 +1,7 @@
 //! Process identity for the reaper.
 //!
-//! Linux reads `/proc/<pid>/stat`. macOS has no `/proc`; it asks `proc_pidinfo`
-//! for the BSD process record. A starttime only has to stay stable on one OS,
-//! so a reused pid does not compare equal to the process Keel spawned.
+//! A starttime only has to stay stable for one process on one OS, so a reused
+//! pid does not compare equal.
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -71,9 +70,10 @@ const SSLEEP: u32 = 3;
 const SZOMB: u32 = 5;
 
 /// `arg == 0` does not search the zombie list, so a zombie looks absent.
-/// That matches the Linux reaper treating state `Z` as dead.
+/// That matches the Linux reaper treating state `Z` as dead. A nonzero `arg`
+/// is how a test sees an unreaped zombie.
 #[cfg(target_os = "macos")]
-fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
+fn bsdinfo(pid: u32, arg: u64) -> Option<libc::proc_bsdinfo> {
     if pid == 0 {
         return None;
     }
@@ -83,7 +83,7 @@ fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
         libc::proc_pidinfo(
             pid as i32,
             libc::PROC_PIDTBSDINFO,
-            0,
+            arg,
             &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
             size,
         )
@@ -96,7 +96,7 @@ fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn read_starttime(pid: u32) -> Option<String> {
-    let info = bsdinfo(pid)?;
+    let info = bsdinfo(pid, 0)?;
     if info.pbi_status == SZOMB {
         return None;
     }
@@ -108,7 +108,7 @@ pub(crate) fn read_starttime(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn read_pgrp(pid: u32) -> Option<i64> {
-    let info = bsdinfo(pid)?;
+    let info = bsdinfo(pid, 0)?;
     if info.pbi_status == SZOMB || info.pbi_pgid == 0 {
         return None;
     }
@@ -120,7 +120,7 @@ pub(crate) fn pid_visible(pid: i64) -> bool {
     if pid <= 0 || pid > i64::from(u32::MAX) {
         return false;
     }
-    bsdinfo(pid as u32).is_some()
+    bsdinfo(pid as u32, 1).is_some()
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -128,7 +128,7 @@ pub(crate) fn still_running(pid: i64) -> bool {
     if pid <= 0 || pid > i64::from(u32::MAX) {
         return false;
     }
-    let Some(info) = bsdinfo(pid as u32) else {
+    let Some(info) = bsdinfo(pid as u32, 0) else {
         return false;
     };
     matches!(info.pbi_status, SRUN | SSLEEP)
@@ -139,7 +139,7 @@ pub(crate) fn leader_dead(pid: i64) -> bool {
     if pid <= 0 || pid > i64::from(u32::MAX) {
         return true;
     }
-    match bsdinfo(pid as u32) {
+    match bsdinfo(pid as u32, 0) {
         None => true,
         Some(info) => info.pbi_status == SZOMB,
     }

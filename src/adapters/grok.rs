@@ -24,6 +24,7 @@ use crate::claim::{self, Target};
 use crate::daemon::read_proc_starttime;
 use crate::db::{Error, Result};
 use crate::proc;
+use crate::psinfo::{leader_dead, read_pgrp};
 use crate::state::{self, Role};
 
 const FORBIDDEN_PORT: u16 = 2419;
@@ -870,10 +871,6 @@ fn dial(port: u16, secret: &str, pid: i64) -> Result<Socket> {
     Err(last)
 }
 
-fn leader_dead(pid: i64) -> bool {
-    crate::psinfo::leader_dead(pid)
-}
-
 fn dial_once(port: u16, secret: &str) -> Result<Socket> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
@@ -1031,10 +1028,6 @@ fn spawn_grouped(program: &Path, args: &[String], log_path: &Path) -> Result<Spa
             Err(live) => Err(live),
         },
     }
-}
-
-fn read_pgrp(pid: u32) -> Option<i64> {
-    crate::psinfo::read_pgrp(pid)
 }
 
 fn pick_port() -> Result<u16> {

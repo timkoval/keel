@@ -4287,7 +4287,7 @@ mod tests {
         found
     }
 
-    /// `netstat` local addresses look like `127.0.0.1.7431`. There is no `/proc/net/tcp`.
+    /// `netstat` local addresses look like `127.0.0.1.7431`.
     #[cfg(target_os = "macos")]
     fn loopback_only(port: u16) -> bool {
         let output = std::process::Command::new("/usr/sbin/netstat")

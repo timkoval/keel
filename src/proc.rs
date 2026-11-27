@@ -385,15 +385,6 @@ mod tests {
         path
     }
 
-    /// `Some` while the pid is still listed. The state character is Linux-only.
-    fn proc_state(pid: i64) -> Option<()> {
-        if pid_visible(pid) {
-            Some(())
-        } else {
-            None
-        }
-    }
-
     fn wait_marker(path: &Path) -> bool {
         for _ in 0..100 {
             if path.is_file() && fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
@@ -535,8 +526,8 @@ mod tests {
             gpid
         );
         assert!(group_empty(spawned.pgid).unwrap());
-        assert!(proc_state(gpid).is_none(), "grandchild still in /proc");
-        assert!(proc_state(spawned.pid).is_none(), "leader still in /proc");
+        assert!(!pid_visible(gpid), "grandchild still in /proc");
+        assert!(!pid_visible(spawned.pid), "leader still in /proc");
         let _ = setup.item;
     }
 
@@ -580,8 +571,8 @@ mod tests {
             .unwrap();
         assert_eq!(state_name, "queued");
         assert!(group_empty(spawned.pgid).unwrap());
-        assert!(proc_state(gpid).is_none(), "grandchild still in /proc");
-        assert!(proc_state(spawned.pid).is_none(), "leader still in /proc");
+        assert!(!pid_visible(gpid), "grandchild still in /proc");
+        assert!(!pid_visible(spawned.pid), "leader still in /proc");
     }
 
     #[test]
@@ -638,7 +629,7 @@ mod tests {
         assert_eq!(state_name, "queued");
         assert!(marker.is_file());
         assert!(group_empty(spawned.pgid).unwrap());
-        assert!(proc_state(gpid).is_none());
+        assert!(!pid_visible(gpid));
     }
 
     #[test]
@@ -1017,7 +1008,7 @@ mod tests {
             "{}",
             cleared.error
         );
-        assert!(proc_state(spawned.pid).is_none());
+        assert!(!pid_visible(spawned.pid));
     }
 
     #[test]
@@ -1148,11 +1139,8 @@ mod tests {
         }
 
         claim::empty_spawned_groups(&setup.db, &setup.item).unwrap();
-        assert!(
-            proc_state(spawned.pid).is_none(),
-            "spawned leader still live"
-        );
-        assert!(proc_state(gpid).is_none(), "grandchild still live");
+        assert!(!pid_visible(spawned.pid), "spawned leader still live");
+        assert!(!pid_visible(gpid), "grandchild still live");
         assert!(group_empty(spawned.pgid).unwrap());
         assert!(still_running(ext_pid), "external pid was signaled");
         assert!(still_running(reused_pid), "reused pid was signaled");

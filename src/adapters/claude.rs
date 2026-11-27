@@ -18,6 +18,7 @@ use crate::claim::{self, Target};
 use crate::daemon::read_proc_starttime;
 use crate::db::{Error, Result};
 use crate::proc;
+use crate::psinfo::read_pgrp;
 use crate::state::{self, Role};
 
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
@@ -588,10 +589,6 @@ fn spawn_grouped(
             Err(live) => Err(live),
         },
     }
-}
-
-fn read_pgrp(pid: u32) -> Option<i64> {
-    crate::psinfo::read_pgrp(pid)
 }
 
 fn heartbeat_loop(
