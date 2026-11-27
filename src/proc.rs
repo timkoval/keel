@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::daemon::read_proc_starttime;
 use crate::db::{Error, Result};
+use crate::psinfo::read_pgrp;
 
 /// Linux errno and signals. These values are the kernel ABI, not libc headers.
 const ESRCH: i32 = 3;
@@ -342,14 +343,6 @@ fn record_gone(pid: i64, starttime: Option<&str>) -> bool {
     }
 }
 
-fn read_pgrp(pid: u32) -> Option<i64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let end = text.rfind(')')?;
-    let fields: Vec<&str> = text[end + 1..].split_whitespace().collect();
-    // `/proc/pid/stat` field 5, the third field after `comm`.
-    fields.get(2)?.parse().ok()
-}
-
 #[cfg(test)]
 pub(crate) struct GroupGuard {
     pub pgid: Option<i64>,
@@ -370,6 +363,7 @@ mod tests {
     use super::*;
     use crate::claim::{self, ClaimInput, Target};
     use crate::db::open_in_memory;
+    use crate::psinfo::{pid_visible, still_running};
     use crate::state::{self, RawIntake, Release};
     use rusqlite::params;
     use std::os::unix::process::CommandExt;
@@ -389,20 +383,6 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    fn proc_state(pid: i64) -> Option<char> {
-        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let end = text.rfind(')')?;
-        text[end + 1..]
-            .split_whitespace()
-            .next()
-            .and_then(|state| state.chars().next())
-    }
-
-    /// Sleeping or running. A zombie means we signaled and have not reaped.
-    fn still_running(pid: i64) -> bool {
-        matches!(proc_state(pid), Some('S') | Some('R') | Some('D'))
     }
 
     fn wait_marker(path: &Path) -> bool {
@@ -546,8 +526,8 @@ mod tests {
             gpid
         );
         assert!(group_empty(spawned.pgid).unwrap());
-        assert!(proc_state(gpid).is_none(), "grandchild still in /proc");
-        assert!(proc_state(spawned.pid).is_none(), "leader still in /proc");
+        assert!(!pid_visible(gpid), "grandchild still in /proc");
+        assert!(!pid_visible(spawned.pid), "leader still in /proc");
         let _ = setup.item;
     }
 
@@ -591,8 +571,8 @@ mod tests {
             .unwrap();
         assert_eq!(state_name, "queued");
         assert!(group_empty(spawned.pgid).unwrap());
-        assert!(proc_state(gpid).is_none(), "grandchild still in /proc");
-        assert!(proc_state(spawned.pid).is_none(), "leader still in /proc");
+        assert!(!pid_visible(gpid), "grandchild still in /proc");
+        assert!(!pid_visible(spawned.pid), "leader still in /proc");
     }
 
     #[test]
@@ -649,7 +629,7 @@ mod tests {
         assert_eq!(state_name, "queued");
         assert!(marker.is_file());
         assert!(group_empty(spawned.pgid).unwrap());
-        assert!(proc_state(gpid).is_none());
+        assert!(!pid_visible(gpid));
     }
 
     #[test]
@@ -1028,7 +1008,7 @@ mod tests {
             "{}",
             cleared.error
         );
-        assert!(proc_state(spawned.pid).is_none());
+        assert!(!pid_visible(spawned.pid));
     }
 
     #[test]
@@ -1159,11 +1139,8 @@ mod tests {
         }
 
         claim::empty_spawned_groups(&setup.db, &setup.item).unwrap();
-        assert!(
-            proc_state(spawned.pid).is_none(),
-            "spawned leader still live"
-        );
-        assert!(proc_state(gpid).is_none(), "grandchild still live");
+        assert!(!pid_visible(spawned.pid), "spawned leader still live");
+        assert!(!pid_visible(gpid), "grandchild still live");
         assert!(group_empty(spawned.pgid).unwrap());
         assert!(still_running(ext_pid), "external pid was signaled");
         assert!(still_running(reused_pid), "reused pid was signaled");

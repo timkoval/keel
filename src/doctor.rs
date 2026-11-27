@@ -772,8 +772,8 @@ fn worktree_lines(data_dir: &Path, items: &[ItemFact], jobs: &[JobFact]) -> Vec<
     lines
 }
 
-/// Compare the stored starttime to `/proc`. A mismatch is a report: this does
-/// not signal the pid, including when the number was reused.
+/// Compare the stored starttime to the live process. A mismatch is a report:
+/// this does not signal the pid, including when the number was reused.
 fn lease_lines(items: &[ItemFact], jobs: &[JobFact]) -> Vec<String> {
     let mut lines = Vec::new();
     for item in items {
@@ -1524,7 +1524,7 @@ mod tests {
             joined.contains("pid 2147483646 starttime 9 != dead"),
             "{joined}"
         );
-        assert!(Path::new(&format!("/proc/{pid}")).is_dir());
+        assert!(crate::psinfo::pid_visible(pid));
         assert!(dropped_tree.is_dir());
         assert!(dead_tree.is_dir());
         assert!(live_tree.is_dir());
@@ -1539,7 +1539,7 @@ mod tests {
         let lines = run(&db, &cfg).unwrap();
         let joined = lines.join("\n");
         assert!(!joined.contains(&format!("pid {pid}")), "{joined}");
-        assert!(Path::new(&format!("/proc/{pid}")).is_dir());
+        assert!(crate::psinfo::pid_visible(pid));
     }
 
     #[test]

@@ -2559,8 +2559,13 @@ pub(crate) fn acquire_lock(path: &Path) -> Result<LockGuard> {
         return Err(err.into());
     }
     let pid = std::process::id();
-    let start = read_proc_starttime(pid)
-        .ok_or_else(|| Error::Invalid("could not read this process starttime from /proc".into()))?;
+    let start = read_proc_starttime(pid).ok_or_else(|| {
+        #[cfg(target_os = "linux")]
+        let message = "could not read this process starttime from /proc";
+        #[cfg(target_os = "macos")]
+        let message = "could not read this process starttime";
+        Error::Invalid(message.into())
+    })?;
     write_lock(&mut file, pid, &start)?;
     Ok(LockGuard { file, pid, start })
 }
@@ -2591,15 +2596,7 @@ fn parse_lock(text: &str) -> Option<(u32, String)> {
 }
 
 pub(crate) fn read_proc_starttime(pid: u32) -> Option<String> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    starttime_after_comm(&text)
-}
-
-/// Field 22 of `/proc/pid/stat`. `comm` may contain spaces, so count after `)`.
-fn starttime_after_comm(text: &str) -> Option<String> {
-    let end = text.rfind(')')?;
-    let fields: Vec<&str> = text[end + 1..].split_whitespace().collect();
-    fields.get(19).map(|value| (*value).to_string())
+    crate::psinfo::read_starttime(pid)
 }
 
 fn is_idle(err: &std::io::Error) -> bool {
@@ -2713,7 +2710,7 @@ mod tests {
         fs::create_dir_all(&cfg.data_dir).unwrap();
         fs::create_dir_all(&cfg.runtime_dir).unwrap();
         fs::write(&cfg.lock_path, "2147483646 1\n").unwrap();
-        assert!(!Path::new("/proc/2147483646").exists());
+        assert!(!crate::psinfo::pid_visible(2_147_483_646));
         let listener = StdUnix::bind(&cfg.socket_path).unwrap();
         drop(listener);
         let running = Running::start(cfg.clone()).unwrap();
@@ -4086,17 +4083,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         fn alive(pid: i64) -> bool {
-            let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-                return false;
-            };
-            let Some(end) = text.rfind(')') else {
-                return false;
-            };
-            let state = text[end + 1..]
-                .split_whitespace()
-                .next()
-                .and_then(|state| state.chars().next());
-            matches!(state, Some('S') | Some('R') | Some('D'))
+            crate::psinfo::still_running(pid)
         }
 
         struct KillChild(Option<std::process::Child>);
@@ -4280,6 +4267,7 @@ mod tests {
         serde_json::from_str(&html[start..end]).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn loopback_only(port: u16) -> bool {
         let text = fs::read_to_string("/proc/net/tcp").unwrap();
         let suffix = format!(":{port:04X}");
@@ -4292,6 +4280,36 @@ mod tests {
                 found = true;
                 let ip = local.split(':').next().unwrap_or("");
                 if ip != "0100007F" {
+                    return false;
+                }
+            }
+        }
+        found
+    }
+
+    /// `netstat` local addresses look like `127.0.0.1.7431`.
+    #[cfg(target_os = "macos")]
+    fn loopback_only(port: u16) -> bool {
+        let output = std::process::Command::new("/usr/sbin/netstat")
+            .args(["-an", "-p", "tcp"])
+            .output()
+            .expect("netstat");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let port = port.to_string();
+        let mut found = false;
+        for line in text.lines() {
+            if !line.contains("LISTEN") {
+                continue;
+            }
+            let Some(local) = line.split_whitespace().nth(3) else {
+                continue;
+            };
+            let Some((ip, listed)) = local.rsplit_once('.') else {
+                continue;
+            };
+            if listed == port {
+                found = true;
+                if ip != "127.0.0.1" {
                     return false;
                 }
             }

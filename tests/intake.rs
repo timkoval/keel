@@ -28,7 +28,8 @@ impl Drop for KillLock {
         }
         unsafe { kill(pid, 15) };
         for _ in 0..50 {
-            if fs::metadata(format!("/proc/{pid}")).is_err() {
+            let rc = unsafe { kill(pid, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(3) {
                 return;
             }
             thread::sleep(Duration::from_millis(20));

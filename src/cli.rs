@@ -1848,11 +1848,11 @@ mod tests {
             .parse()
             .expect("grandchild did not write the worktree");
         assert_ne!(gpid, pid);
-        assert!(std::path::Path::new(&format!("/proc/{gpid}")).exists());
+        assert!(crate::psinfo::pid_visible(gpid));
         dispatch(&cfg, &["release".into(), id.clone()]).unwrap();
         assert_eq!(state_of(&cfg, &id), "inbox");
         assert!(crate::proc::group_empty(pgid).unwrap());
-        assert!(!std::path::Path::new(&format!("/proc/{gpid}")).exists());
+        assert!(!crate::psinfo::pid_visible(gpid));
         assert_eq!(crate::git::rev_parse(&repo, "HEAD").unwrap(), head);
         drop(running);
     }
