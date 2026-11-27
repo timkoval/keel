@@ -4,6 +4,8 @@ Keel is the local pipeline from an inbox item to a local merge. This crate is th
 
 `keel serve` listens on a Unix socket and on `127.0.0.1` for GET document routes. `keel add` is the intake path. `keel inbox`, `keel list`, `keel show`, `keel url`, `keel open`, `keel status`, `keel doctor`, `keel mcp`, and `keel tui` talk to the socket. They do not open SQLite. `keel mcp` is a stdio proxy and has no merge tool.
 
+Usage: [docs/usage.md](docs/usage.md)
+
 Design: `~/agent-artifacts/shared/plans/keel.md`
 
 That file is the specification. This repository does not carry a second copy.
