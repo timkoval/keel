@@ -39,11 +39,11 @@ Esc cancels a note or an approval. Any key other than `M` cancels an armed merge
 ## Add an item
 
 ```
-keel add --repo ~/git-local/some-repo --branch main "Short title"
+keel add --repo ~/git-local/some-repo --branch feat/short-name "Short title"
 keel add --repo ~/git-local/some-repo --body "What to change" "Short title"
 ```
 
-The title is one argument. `--repo` is the checkout the agents will use. `--branch` is the branch they start from and the branch `keel merge` updates. Set both. Keel does not substitute the repo's current branch, and a plan against a repo with no branch stops with `target_branch is unset`. Without `--body`, a terminal records an empty body. A pipe becomes the body, up to 32 KiB.
+The title is one argument. `--repo` is the checkout the agents will use. `--branch` is the branch `keel merge` updates, and it is fixed at add time. Set both. Keel does not substitute the repo's current branch, and a plan against a repo with no branch stops with `target_branch is unset`. Without `--body`, a terminal records an empty body. A pipe becomes the body, up to 32 KiB.
 
 The command prints the item id and the card URL. `keel add` does not start an agent. An agent files an item with this same command, including both `--repo` and `--branch`.
 
@@ -115,11 +115,17 @@ Use the id from `keel add`, or a unique prefix of it. If a prefix matches both a
 
 7. Merge when every job is accepted and the item is `awaiting_merge`.
 
+   Each job is on `keel/<item>/<job>`, in its own worktree. That does not move the primary checkout. `keel merge` combines the accepted leaves onto `keel/<item>/integrate`, then merges that branch into the primary checkout. The checkout must already be clean and on the `--branch` from `keel add`, and the approved base must still be an ancestor of that `HEAD`. If one of these checks fails, the command stops and the checkout is not moved.
+
    ```
+   git checkout feat/short-name
    keel merge ID
+   git checkout -
    ```
 
-   This merges the accepted leaves into the target branch on this machine. It does not push. In the TUI the same action is `m`, then `M`.
+   Nothing is pushed. After a clean merge, Keel deletes the merged job branches. Push the target branch yourself if it should leave this machine. In the TUI the same action is `m`, then `M`.
+
+   Pass a feature branch at `keel add` when the checkout's usual branch, such as `main`, must stay where it is. Create that feature branch at the approved base and check it out only for the merge. An item added with `--branch main` can be merged only while the checkout is on `main`, which moves local `main`.
 
    If git stops, the item is `merge_conflict` and the command prints the integrate worktree. Fix that worktree, then `keel merge ID --continue`. `keel merge ID --abort` returns the item to `awaiting_merge` and drops the integrate worktree. It does not change the target branch or the job branches.
 
