@@ -58,7 +58,7 @@ keel submit ID --token TOKEN --file plan.json
 
 `keel claim` prints the id and the claim token. The prompt file is `$XDG_DATA_HOME/keel/<profile>/prompts/<id>.txt`, or `~/.local/share/keel/<profile>/prompts/<id>.txt` when `XDG_DATA_HOME` is unset. The profile is `default` unless config says otherwise. The prompt names the JSON shape and the output path. Plan and revise do not edit the repo.
 
-A claim lasts fifteen minutes. `keel heartbeat ID --token TOKEN` renews one this session holds. Keel does not signal that claim when it expires. `keel release ID` drops it.
+`keel claim` stores no pid. `keel heartbeat ID --token TOKEN` only slides the lease timestamp. Keel does not expire this row, and it stays claimed until `keel release ID`.
 
 `keel run --adapter claude` is a different path, and it does not start a session. The adapter execs `claude --message`, which current Claude Code rejects, so the run exits before it plans. `-p` is not the stand-in: that is another process, and it exits. `keel run --adapter grok` still starts a Grok worker in this terminal.
 
@@ -177,6 +177,6 @@ A second profile is a second daemon and a second database, not a filter on this 
 
 ## Commands you rarely type
 
-`keel claim`, `keel heartbeat`, and `keel submit` are how a session Keel did not spawn reaches the socket. `keel mcp` is a stdio proxy to the same socket. It can add, list, claim, and submit. It cannot approve, accept, merge, drop, or permit.
+`keel mcp` is a stdio proxy to the same socket. It can add, list, claim, and submit. It cannot approve, accept, merge, drop, or permit. A session Keel did not spawn uses the claim and submit steps above.
 
 `keel run` without `--adapter grok` or `--adapter claude` does not call a model.
