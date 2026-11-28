@@ -115,7 +115,7 @@ Use the id from `keel add`, or a unique prefix of it. If a prefix matches both a
 
 7. Merge when every job is accepted and the item is `awaiting_merge`.
 
-   Each job is on `keel/<item>/<job>`, in its own worktree. That does not move the primary checkout. `keel merge` combines the accepted leaves onto `keel/<item>/integrate`, then merges that branch into the primary checkout. The checkout must already be clean and on the `--branch` from `keel add`, and the approved base must still be an ancestor of that `HEAD`. If one of these checks fails, the command stops and the checkout is not moved.
+   The job branches from step 4 stay in their own worktrees, so that work does not move the primary checkout. `keel merge` combines the accepted leaves onto `keel/<item>/integrate`, then merges that branch into the primary checkout. The checkout must already be clean and on the `--branch` from `keel add`, and the approved base must still be an ancestor of that `HEAD`. If one of these checks fails, the command stops and the checkout is not moved.
 
    ```
    git checkout feat/short-name
