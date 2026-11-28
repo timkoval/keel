@@ -45,7 +45,22 @@ keel add --repo ~/git-local/some-repo --body "What to change" "Short title"
 
 The title is one argument. `--repo` is the checkout the agents will use. `--branch` is the branch they start from and the branch `keel merge` updates. Set both. Keel does not substitute the repo's current branch, and a plan against a repo with no branch stops with `target_branch is unset`. Without `--body`, a terminal records an empty body. A pipe becomes the body, up to 32 KiB.
 
-The command prints the item id and the card URL. `keel add` does not start an agent.
+The command prints the item id and the card URL. `keel add` does not start an agent. An agent files an item with this same command, including both `--repo` and `--branch`.
+
+## A session that is already running
+
+Claim the item, read the prompt Keel writes, and submit the JSON that prompt asks for. Do that work in the session you already have, including with its own subagents. This does not launch Claude or Grok.
+
+```
+keel claim ID --role plan
+keel submit ID --token TOKEN --file plan.json
+```
+
+`keel claim` prints the id and the claim token. The prompt file is `$XDG_DATA_HOME/keel/<profile>/prompts/<id>.txt`, or `~/.local/share/keel/<profile>/prompts/<id>.txt` when `XDG_DATA_HOME` is unset. The profile is `default` unless config says otherwise. The prompt names the JSON shape and the output path. Plan and revise do not edit the repo.
+
+A claim lasts fifteen minutes. `keel heartbeat ID --token TOKEN` renews one this session holds. Keel does not signal that claim when it expires. `keel release ID` drops it.
+
+`keel run --adapter claude` is a different path, and it does not start a session. The adapter execs `claude --message`, which current Claude Code rejects, so the run exits before it plans. `-p` is not the stand-in: that is another process, and it exits. `keel run --adapter grok` still starts a Grok worker in this terminal.
 
 ## One item, end to end
 
@@ -57,9 +72,9 @@ Use the id from `keel add`, or a unique prefix of it. If a prefix matches both a
    keel run ID --role plan --adapter grok
    ```
 
-   `--adapter` is required for a real agent. The default is `fake`, which is a test child, not a model. `claude` is the other adapter. Claude refuses a plan or revise when the item has no worktree.
+   `--adapter` is required for a real agent. The default is `fake`, which is a test child, not a model. `grok` keeps this terminal and asks here when it wants permission. If a tool asks and this terminal is not a tty, run `keel permit ID` in another terminal. `y` allows once, `n` denies, `A` allows the rest of this claim. `--once`, `--deny`, and `--always` are the same answers without a prompt.
 
-   `grok` keeps this terminal and asks here when it wants permission. `claude` returns after spawn. If a tool asks and this terminal is not a tty, run `keel permit ID` in another terminal. `y` allows once, `n` denies, `A` allows the rest of this claim. `--once`, `--deny`, and `--always` are the same answers without a prompt.
+   `claude` is accepted as an adapter name. The launch passes `--message`, which current Claude Code rejects, so that run exits before it plans. A session that is already running uses claim and submit, above.
 
 2. Read the plan. `keel open ID` opens the card. The plan link is on that page, and `keel url --board` opens the board.
 
@@ -86,7 +101,7 @@ Use the id from `keel add`, or a unique prefix of it. If a prefix matches both a
 5. Review with a different run. The implementer cannot review its own job.
 
    ```
-   keel run JOB --role review --adapter claude
+   keel run JOB --role review --adapter grok
    ```
 
 6. Accept or send the job back.
@@ -162,6 +177,6 @@ A second profile is a second daemon and a second database, not a filter on this 
 
 ## Commands you rarely type
 
-`keel claim`, `keel heartbeat`, `keel submit`, and `keel mcp` are the agent path. `keel mcp` is a stdio proxy to the same socket. It can add, list, claim, and submit. It cannot approve, accept, merge, drop, or permit.
+`keel claim`, `keel heartbeat`, and `keel submit` are how a session Keel did not spawn reaches the socket. `keel mcp` is a stdio proxy to the same socket. It can add, list, claim, and submit. It cannot approve, accept, merge, drop, or permit.
 
 `keel run` without `--adapter grok` or `--adapter claude` does not call a model.
